@@ -67,6 +67,8 @@ typedef struct {
     int               pid;
     char              control_text[512];
     char              exe_path[512];
+    uint32_t          window_id;   /* 事件发生时所在窗口 ID（0=无）；截图按它冻结目标，
+                                      避免异步截图时用户已切走导致截到别的窗口 */
 } step_event_t;
 
 typedef void (*step_event_cb)(const step_event_t *ev, void *userdata);
@@ -142,14 +144,14 @@ void os_open_accessibility_settings(void);
 char *os_show_save_dialog(const char *default_name);
 
 typedef void (*toolbar_cb)(void);
-int  os_show_toolbar(toolbar_cb on_start, toolbar_cb on_stop,
-                     toolbar_cb on_save, toolbar_cb on_settings);
+int  os_show_toolbar(toolbar_cb on_start, toolbar_cb on_stop);
 void os_set_recording_state(int recording);
 void os_set_tick_callback(double (*cb)(void));   /* 用于刷新计时显示 */
 void os_hide_toolbar(void);
 
 /* 截图模式: 0=当前窗口, 1=全屏 */
-void os_toggle_capture_mode(void);
+void os_set_capture_mode(int fullscreen);
+int  os_get_capture_mode(void);
 const char *os_capture_mode_label(void);
 
 #ifdef __cplusplus

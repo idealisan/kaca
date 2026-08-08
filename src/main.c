@@ -10,6 +10,9 @@
 static int   g_no_dialog = 0;
 static const char *g_out_path = NULL;
 
+/* 生成带时间戳的默认报告文件名（与 .gitignore 的 step-report-*.html 对应）*/
+static char *default_report_name(void);
+
 static void on_start(void) {
     recorder_start();
     os_set_recording_state(1);
@@ -25,18 +28,8 @@ static void on_stop(void) {
     os_stop_capture();
     recorder_stop();
     os_set_recording_state(0);
-}
 
-/* 生成带时间戳的默认报告文件名（与 .gitignore 的 step-report-*.html 对应）*/
-static char *default_report_name(void) {
-    time_t t = time(NULL);
-    struct tm tm; localtime_r(&t, &tm);
-    char ts[32]; strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
-    char buf[64]; snprintf(buf, sizeof(buf), "step-report-%s.html", ts);
-    return strdup(buf);
-}
-
-static void on_save(void) {
+    /* 停止即保存：弹出保存对话框（或按调试参数直接保存）*/
     const char *path = NULL;
     char *dlg = NULL;
 
@@ -53,15 +46,20 @@ static void on_save(void) {
     } else if (g_no_dialog) {
         path = recorder_save_default();        /* 调试：默认路径 */
     }
-    /* dlg==NULL 且非调试模式：说明用户在对话框里取消了，不保存 */
+    /* dlg==NULL 且非调试模式：用户在对话框里取消了，不保存 */
 
     if (path) printf("报告已保存: %s\n", path);
-    else      fprintf(stderr, "保存失败\n");
+    else      fprintf(stderr, "保存失败（或已取消）\n");
     free(dlg);
 }
 
-static void on_settings(void) {
-    os_toggle_capture_mode();
+/* 生成带时间戳的默认报告文件名（与 .gitignore 的 step-report-*.html 对应）*/
+static char *default_report_name(void) {
+    time_t t = time(NULL);
+    struct tm tm; localtime_r(&t, &tm);
+    char ts[32]; strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
+    char buf[64]; snprintf(buf, sizeof(buf), "step-report-%s.html", ts);
+    return strdup(buf);
 }
 
 int main(int argc, char **argv) {
@@ -80,7 +78,7 @@ int main(int argc, char **argv) {
 
     recorder_init();
     os_set_tick_callback(recorder_elapsed);
-    os_show_toolbar(on_start, on_stop, on_save, on_settings);
+    os_show_toolbar(on_start, on_stop);
 
     recorder_free();
     os_shutdown();

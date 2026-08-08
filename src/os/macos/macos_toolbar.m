@@ -6,7 +6,7 @@
 #include "os/os_api.h"
 #include <stdlib.h>
 
-static toolbar_cb g_on_start = NULL, g_on_stop = NULL, g_on_save = NULL, g_on_settings = NULL;
+static toolbar_cb g_on_start = NULL, g_on_stop = NULL;
 static double (*g_tick)(void) = NULL;
 static int g_recording = 0;
 
@@ -15,14 +15,24 @@ static NSTextField *g_status = NULL;
 static NSTextField *g_elapsed = NULL;
 static NSButton    *g_startBtn = NULL;
 static NSButton    *g_stopBtn = NULL;
-static NSButton    *g_modeBtn = NULL;
+static NSPopUpButton *g_modePopup = NULL;
+@class AppDelegate;
+static AppDelegate *g_delegate = NULL;   /* 强引用，避免 NSApp 不持有 delegate 而被释放 */
+
+/* 关闭工具条窗口即退出进程（小工具不应滞留）*/
+@interface AppDelegate : NSObject <NSApplicationDelegate>
+@end
+@implementation AppDelegate
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
+    (void)sender; return YES;
+}
+@end
 
 @interface TBar : NSObject
 - (void)onTick:(NSTimer *)t;
 - (void)doStart:(id)s;
 - (void)doStop:(id)s;
-- (void)doSave:(id)s;
-- (void)doSettings:(id)s;
+- (void)doMode:(id)s;
 @end
 
 @implementation TBar
@@ -36,31 +46,33 @@ static NSButton    *g_modeBtn = NULL;
 }
 - (void)doStart:(id)s { (void)s; if (g_on_start) g_on_start(); }
 - (void)doStop:(id)s  { (void)s; if (g_on_stop)  g_on_stop(); }
-- (void)doSave:(id)s  { (void)s; if (g_on_save)  g_on_save(); }
-- (void)doSettings:(id)s {
+- (void)doMode:(id)s  {
     (void)s;
-    if (g_on_settings) g_on_settings();
-    [g_modeBtn setTitle:[NSString stringWithUTF8String:os_capture_mode_label()]];
+    if (g_modePopup) {
+        BOOL fs = [[g_modePopup titleOfSelectedItem] isEqualToString:@"全屏"];
+        os_set_capture_mode(fs ? 1 : 0);
+    }
 }
 @end
 
-int os_show_toolbar(toolbar_cb on_start, toolbar_cb on_stop,
-                    toolbar_cb on_save, toolbar_cb on_settings) {
+int os_show_toolbar(toolbar_cb on_start, toolbar_cb on_stop) {
     g_on_start = on_start; g_on_stop = on_stop;
-    g_on_save = on_save; g_on_settings = on_settings;
 
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    g_delegate = [[AppDelegate alloc] init];
+    [NSApp setDelegate:g_delegate];
 
     TBar *bar = [[TBar alloc] init];
 
     NSRect screen = [[NSScreen mainScreen] frame];
-    CGFloat w = 560, h = 48;
+    CGFloat w = 500, h = 48;
     NSRect r = NSMakeRect((screen.size.width - w) / 2,
                           screen.size.height - h - 12, w, h);
 
     g_win = [[NSWindow alloc] initWithContentRect:r
                                         styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                                                  | NSWindowStyleMaskMiniaturizable
                                           backing:NSBackingStoreBuffered
                                             defer:NO];
     [g_win setLevel:NSFloatingWindowLevel];
@@ -92,15 +104,14 @@ int os_show_toolbar(toolbar_cb on_start, toolbar_cb on_stop,
     [g_stopBtn setEnabled:NO];
     [v addSubview:g_stopBtn];
 
-    g_modeBtn = [NSButton buttonWithTitle:[NSString stringWithUTF8String:os_capture_mode_label()]
-                                   target:bar action:@selector(doSettings:)];
-    [g_modeBtn setFrame:NSMakeRect(415, 11, 60, 26)];
-    [v addSubview:g_modeBtn];
-
-    NSButton *save = [NSButton buttonWithTitle:@"保存报告"
-                                        target:bar action:@selector(doSave:)];
-    [save setFrame:NSMakeRect(480, 11, 70, 26)];
-    [v addSubview:save];
+    g_modePopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(415, 11, 80, 26)
+                                             pullsDown:NO];
+    [g_modePopup addItemWithTitle:@"窗口"];
+    [g_modePopup addItemWithTitle:@"全屏"];
+    [g_modePopup selectItemWithTitle:[NSString stringWithUTF8String:os_capture_mode_label()]];
+    [g_modePopup setTarget:bar];
+    [g_modePopup setAction:@selector(doMode:)];
+    [v addSubview:g_modePopup];
 
     [NSTimer scheduledTimerWithTimeInterval:0.5 target:bar
                                    selector:@selector(onTick:)

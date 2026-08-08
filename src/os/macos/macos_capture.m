@@ -51,7 +51,8 @@ static void poll_frontmost(void);
 
 static int g_fullscreen = 0;  /* 0=当前窗口 1=全屏 */
 
-void os_toggle_capture_mode(void) { g_fullscreen = g_fullscreen ? 0 : 1; }
+void os_set_capture_mode(int fullscreen) { g_fullscreen = fullscreen ? 1 : 0; }
+int  os_get_capture_mode(void) { return g_fullscreen; }
 const char *os_capture_mode_label(void) { return g_fullscreen ? "全屏" : "窗口"; }
 
 static void keycode_to_name(int kc, char *out, size_t n) {
@@ -189,6 +190,30 @@ static uint32_t frontmost_window(CGRect *outBounds) {
     }
 }
 
+/* 按 windowNumber 查窗口 bounds（供截图时定位光标用）*/
+static int window_bounds(uint32_t wid, CGRect *outBounds) {
+    if (!wid) return 0;
+    CFArrayRef list = CGWindowListCopyWindowInfo(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID);
+    if (!list) return 0;
+    int found = 0;
+    CFIndex n = CFArrayGetCount(list);
+    for (CFIndex i = 0; i < n; i++) {
+        CFDictionaryRef d = (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
+        CFNumberRef num = CFDictionaryGetValue(d, kCGWindowNumber);
+        uint32_t w = 0;
+        if (num) CFNumberGetValue(num, kCFNumberSInt32Type, &w);
+        if (w == wid) {
+            CFDictionaryRef bd = CFDictionaryGetValue(d, kCGWindowBounds);
+            if (bd && CGRectMakeWithDictionaryRepresentation(bd, outBounds)) found = 1;
+            break;
+        }
+    }
+    CFRelease(list);
+    return found;
+}
+
 /* 找到光标所在窗口，返回其 rect 与 windowID（找不到返回 0）*/
 static int window_at_point(CGPoint loc, CGRect *outBounds, uint32_t *outWin) {
     CFArrayRef list = CGWindowListCopyWindowInfo(
@@ -263,9 +288,10 @@ static void fill_context(step_event_t *ev, CGPoint loc) {
                 }
                 break;
             }
-            CFRelease(list);
-        }
+        CFRelease(list);
     }
+    ev->window_id = wid;   /* 冻结事件发生时所在窗口，供截图按此窗口截取 */
+}
 }
 
 static CGEventRef event_tap_cb(CGEventTapProxy proxy, CGEventType type,
@@ -377,20 +403,23 @@ static void poll_frontmost(void) {
     if (g_focus_baseline) {
         /* 仅记录基线，不生成步骤 */
         g_focus_baseline = 0;
-        strncpy(g_last_app, app, sizeof(g_last_app) - 1); g_last_pid = pid;
+        g_last_pid = pid;
+        strncpy(g_last_app, app, sizeof(g_last_app) - 1);
         strncpy(g_last_title, title, sizeof(g_last_title) - 1);
-        strncpy(g_cand_app, app, sizeof(g_cand_app) - 1); g_cand_pid = pid;
+        g_cand_pid = pid;
+        strncpy(g_cand_app, app, sizeof(g_cand_app) - 1);
         strncpy(g_cand_title, title, sizeof(g_cand_title) - 1);
         return;
     }
 
-    /* 与已确认状态相同 -> 无变化 */
-    if (pid == g_last_pid && strcmp(title, g_last_title) == 0 && strcmp(app, g_last_app) == 0)
-        return;
+    /* 同一应用（仅窗口标题变化，如终端目录/命令变化）-> 不记新切换，
+       彻底消除标题抖动导致的重复/漏记 */
+    if (pid == g_last_pid) return;
 
-    /* 与候选相同 -> 连续两次轮询一致，确认切换并生成 FOCUS 步骤 */
-    if (pid == g_cand_pid && strcmp(title, g_cand_title) == 0 && strcmp(app, g_cand_app) == 0) {
-        strncpy(g_last_app, app, sizeof(g_last_app) - 1); g_last_pid = pid;
+    /* 与候选 PID 一致 -> 连续两次轮询确认切换，生成 1 条 FOCUS */
+    if (pid == g_cand_pid) {
+        g_last_pid = pid;
+        strncpy(g_last_app, app, sizeof(g_last_app) - 1);
         strncpy(g_last_title, title, sizeof(g_last_title) - 1);
 
         step_event_t ev;
@@ -406,8 +435,9 @@ static void poll_frontmost(void) {
         return;
     }
 
-    /* 不同 -> 设为候选，等下一次轮询确认（抑制单次抖动造成的重复记录）*/
-    strncpy(g_cand_app, app, sizeof(g_cand_app) - 1); g_cand_pid = pid;
+    /* 不同应用 -> 设为候选，等下一次轮询确认（抑制单次抖动造成的重复记录）*/
+    g_cand_pid = pid;
+    strncpy(g_cand_app, app, sizeof(g_cand_app) - 1);
     strncpy(g_cand_title, title, sizeof(g_cand_title) - 1);
 }
 
@@ -447,12 +477,17 @@ int os_capture_screenshot(const step_event_t *ev, const char *op_marker,
     int fs = g_fullscreen;
     CGRect bounds; uint32_t wid = 0;
     if (!fs) {
-        /* 截最前台应用的窗口（而不是光标下的窗口：否则切换窗口时光标常在
-           Dock 上，会误截到 Dock 栏）*/
-        wid = frontmost_window(&bounds);
-        if (!wid) {
-            fs = 1;
-            bounds = CGDisplayBounds(CGMainDisplayID());
+        /* 窗口模式：优先截事件发生时所在的窗口（ev->window_id 在事件时冻结），
+           这样即使用户之后切换到别的窗口，本步截图仍对应当时操作的窗口，
+           与上下文（进程名/相对位置）一致，不会出现「Chrome 输入却截到终端」。*/
+        if (ev && ev->window_id && window_bounds(ev->window_id, &bounds)) {
+            wid = ev->window_id;
+        } else {
+            wid = frontmost_window(&bounds);
+            if (!wid) {
+                fs = 1;
+                bounds = CGDisplayBounds(CGMainDisplayID());
+            }
         }
     } else {
         fs = 1;

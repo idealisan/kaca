@@ -37,12 +37,13 @@ int  os_get_frontmost_window(char *a, size_t an, char *t, size_t tn,
 }
 void os_drain_main(void) {}
 char *os_show_save_dialog(const char *dn) { (void)dn; return NULL; }
-int  os_show_toolbar(toolbar_cb a, toolbar_cb b, toolbar_cb c, toolbar_cb d) {
-    (void)a;(void)b;(void)c;(void)d; return -1;
+int  os_show_toolbar(toolbar_cb a, toolbar_cb b) {
+    (void)a;(void)b; return -1;
 }
 void os_set_recording_state(int r) { (void)r; }
 void os_set_tick_callback(double (*cb)(void)) { (void)cb; }
 void os_hide_toolbar(void) {}
-void os_toggle_capture_mode(void) {}
+void os_set_capture_mode(int fs) { (void)fs; }
+int  os_get_capture_mode(void) { return 0; }
 const char *os_capture_mode_label(void) { return "窗口"; }
 void os_open_accessibility_settings(void) {}
