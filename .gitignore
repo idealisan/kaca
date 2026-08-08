@@ -1,0 +1,8 @@
+# 构建产物
+build/
+
+# 运行生成的步骤报告（输出到项目目录）
+step-report-*.html
+
+# macOS
+.DS_Store
