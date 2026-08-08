@@ -16,8 +16,10 @@ static char *default_report_name(void);
 static void on_start(void) {
     recorder_start();
     os_set_recording_state(1);
+    os_frame_capture_start();   /* 后台持续抓帧，用于按事件时间选帧 */
     if (os_start_capture(recorder_handle_event, NULL) != 0) {
         recorder_stop();
+        os_frame_capture_stop();
         os_set_recording_state(0);
         os_open_accessibility_settings();
         fprintf(stderr, "事件捕获启动失败：请在本机「系统设置 → 隐私与安全性 → 辅助功能」中启用 kaca，然后重新点击「开始录制」。\n");
@@ -51,6 +53,7 @@ static void on_stop(void) {
     if (path) printf("报告已保存: %s\n", path);
     else      fprintf(stderr, "保存失败（或已取消）\n");
     free(dlg);
+    os_frame_capture_stop();    /* 停止抓帧并释放环形缓冲（recorder_stop 已泵完在途截图）*/
 }
 
 /* 生成带时间戳的默认报告文件名（与 .gitignore 的 step-report-*.html 对应）*/

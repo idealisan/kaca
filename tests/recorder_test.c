@@ -25,18 +25,18 @@ static const uint8_t PNG1x1[] = {
     0x45,0x4E,0x44,0xAE,0x42,0x60,0x82
 };
 
-int os_capture_screenshot(const step_event_t *ev, const char *m,
-                          uint8_t **out_png, size_t *out_len) {
+void os_frame_capture_start(void) {}
+void os_frame_capture_stop(void) {}
+void os_grab_frame_for_event(const step_event_t *ev, const char *m,
+                             void (*cb)(uint8_t *, size_t, void *), void *ud) {
     (void)ev; (void)m;
-    *out_png = malloc(sizeof(PNG1x1));
-    memcpy(*out_png, PNG1x1, sizeof(PNG1x1));
-    *out_len = sizeof(PNG1x1);
-    return 0;
+    uint8_t *p = malloc(sizeof(PNG1x1));
+    memcpy(p, PNG1x1, sizeof(PNG1x1));   /* 测试里同步完成，给个最小占位 */
+    cb(p, sizeof(PNG1x1), ud);
 }
 int os_get_system_info(system_info_t *out) {
     memset(out, 0, sizeof(*out));
     strcpy(out->os_name, "TestOS");
-    strcpy(out->os_version, "1.0");
     strcpy(out->cpu_brand, "Test CPU");
     out->cpu_cores = 8;
     out->mem_bytes = 16ULL * 1024 * 1024 * 1024;
@@ -44,13 +44,6 @@ int os_get_system_info(system_info_t *out) {
     return 0;
 }
 void os_run_on_main(void (*fn)(void *), void *arg) { fn(arg); }
-
-void os_async_screenshot(const step_event_t *ev, const char *m,
-                         void (*cb)(uint8_t *, size_t, void *), void *ud) {
-    uint8_t *p = NULL; size_t l = 0;
-    os_capture_screenshot(ev, m, &p, &l);   /* 测试里同步完成 */
-    cb(p, l, ud);
-}
 void os_get_cursor(int *x, int *y) { *x = 0; *y = 0; }
 int os_get_frontmost_window(char *app, size_t app_n, char *title, size_t title_n,
                             int *pid, char *exe, size_t exe_n) {

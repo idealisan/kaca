@@ -16,19 +16,19 @@ void os_shutdown(void) {}
 int  os_ensure_permissions(void) { return 1; }
 int  os_start_capture(step_event_cb cb, void *userdata) { (void)cb;(void)userdata; return -1; }
 void os_stop_capture(void) {}
-int  os_capture_screenshot(const step_event_t *ev, const char *m, uint8_t **p, size_t *l) {
-    (void)ev;(void)m; *p = NULL; *l = 0; return -1;
-}
 int  os_get_system_info(system_info_t *out) {
     memset(out, 0, sizeof(*out));
     strcpy(out->os_name, "Windows");
     return 0;
 }
 void os_run_on_main(void (*fn)(void *), void *arg) { fn(arg); }
-void os_async_screenshot(const step_event_t *ev, const char *m,
-                         void (*cb)(uint8_t *, size_t, void *), void *ud) {
-    (void)ev; uint8_t *p = NULL; size_t l = 0;
-    if (os_capture_screenshot(ev, m, &p, &l) == 0) cb(p, l, ud); else cb(NULL, 0, ud);
+void os_frame_capture_start(void) {}
+void os_frame_capture_stop(void) {}
+void os_grab_frame_for_event(const step_event_t *ev, const char *m,
+                             void (*cb)(uint8_t *, size_t, void *), void *ud) {
+    (void)ev; (void)m; uint8_t *p = (uint8_t *)malloc(4);
+    if (p) { p[0]='W'; p[1]='E'; p[2]='B'; p[3]='P'; }
+    cb(p, p ? 4 : 0, ud);
 }
 void os_get_cursor(int *x, int *y) { *x = 0; *y = 0; }
 int  os_get_frontmost_window(char *a, size_t an, char *t, size_t tn,

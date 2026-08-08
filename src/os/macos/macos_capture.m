@@ -9,6 +9,7 @@
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
 #import <dispatch/dispatch.h>
+#import <webp/encode.h>
 #import <sys/sysctl.h>
 #import <sys/time.h>
 #import <libproc.h>
@@ -489,81 +490,195 @@ static void poll_frontmost(void) {
     strncpy(g_cand_title, title, sizeof(g_cand_title) - 1);
 }
 
-/* ------------------------- 截图合成 ------------------------- */
+/* ------------------------- 帧环形缓冲（时间对齐） -------------------------
+ * 后台以固定帧率持续抓整屏，每帧打 CFAbsoluteTime 时间戳存入环形缓冲。
+ * 事件发生时不再「重新拍」，而是从缓冲里挑出事件时刻那一帧 → 截图时间与事件时间对齐。
+ * 抓取用进程内 CGDisplayCreateImage（无 screencapture 子进程，延迟低），后台线程执行。
+ */
+#define FRAME_FPS       12
+#define FRAME_CAP       (FRAME_FPS * 2)   /* 保留约 2 秒（足够：相关帧总在事件前 1 帧内）*/
+#define FRAME_MAX_EDGE  1280              /* 降采样最长边（同时约束报告体积） */
+#define FRAME_WEBP_Q    75.0f
 
-/* 通过系统 screencapture 命令抓取屏幕/窗口（macOS 15+ 已移除旧 CG 截图 API）*/
-static NSImage *grab_screenshot(int fs, uint32_t wid) {
-    NSString *tmp = [NSTemporaryDirectory() stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"kaca_%lld.png",
-                                   (long long)(CFAbsoluteTimeGetCurrent() * 1000.0)]];
-    NSImage *im = nil;
-    @autoreleasepool {
-        NSTask *t = [[NSTask alloc] init];
-        t.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/screencapture"];
-        NSMutableArray *args = [NSMutableArray arrayWithObjects:@"-x", @"-t", @"png", nil];
-        if (!fs) {
-            [args addObject:@"-l"];
-            [args addObject:[NSString stringWithFormat:@"%u", wid]];
-        }
-        [args addObject:tmp];
-        t.arguments = args;
-        [t launch];
-        [t waitUntilExit];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:tmp]) {
-            im = [[NSImage alloc] initWithContentsOfFile:tmp];
-        }
-        [[NSFileManager defaultManager] removeItemAtPath:tmp error:nil];
+typedef struct {
+    uint8_t  *rgba;        /* 行优先 RGBA，顶向下（与屏幕一致），长度 w*h*4 */
+    int       w, h;
+    double    t;           /* CFAbsoluteTime（unix 秒） */
+    uint32_t  wid;         /* 该帧最前台窗口 ID（FOCUS 选帧用） */
+    CGRect    region;      /* 该帧对应的屏幕区域（光标定位用，屏幕坐标） */
+} cap_frame_t;
+
+static cap_frame_t   g_ring[FRAME_CAP];
+static int           g_ring_head = 0;
+static int           g_ring_count = 0;
+static dispatch_queue_t g_capq = NULL;
+static dispatch_source_t g_capsrc = NULL;
+
+/* 进程内抓一帧整屏到 f（顶向下 RGBA，已降采样）。返回 1 成功。*/
+static int capture_frame_into(cap_frame_t *f, CGDirectDisplayID disp) {
+    CGImageRef img = CGDisplayCreateImage(disp);
+    if (!img) return 0;
+    int iw = (int)CGImageGetWidth(img);
+    int ih = (int)CGImageGetHeight(img);
+    int w = iw, h = ih;
+    if (iw > FRAME_MAX_EDGE || ih > FRAME_MAX_EDGE) {
+        double s = (double)FRAME_MAX_EDGE / (double)(iw > ih ? iw : ih);
+        w = (int)(iw * s + 0.5); h = (int)(ih * s + 0.5);
     }
-    return im;
+    if (w < 1) w = 1; if (h < 1) h = 1;
+    uint8_t *rgba = (uint8_t *)malloc((size_t)w * h * 4);
+    if (!rgba) { CGImageRelease(img); return 0; }
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(rgba, w, h, 8, (size_t)w * 4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrderDefault);
+    CGContextTranslateCTM(ctx, 0, h);          /* 翻转为顶向下，与屏幕一致 */
+    CGContextScaleCTM(ctx, 1, -1);
+    CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(cs);
+    CGImageRelease(img);
+    f->rgba = rgba; f->w = w; f->h = h;
+    f->t = CFAbsoluteTimeGetCurrent() + UNIX_OFFSET;
+    f->wid = frontmost_window(NULL);
+    f->region = CGDisplayBounds(disp);
+    return 1;
 }
 
-int os_capture_screenshot(const step_event_t *ev, const char *op_marker,
-                          uint8_t **out_png, size_t *out_len) {
-    *out_png = NULL; *out_len = 0;
-    CGPoint loc = CGPointMake(ev ? ev->cursor_x : 0, ev ? ev->cursor_y : 0);
-
-    int fs = g_fullscreen;
-    CGRect bounds; uint32_t wid = 0;
-    if (!fs) {
-        /* 窗口模式：优先截事件发生时所在的窗口（ev->window_id 在事件时冻结），
-           这样即使用户之后切换到别的窗口，本步截图仍对应当时操作的窗口，
-           与上下文（进程名/相对位置）一致，不会出现「Chrome 输入却截到终端」。*/
-        if (ev && ev->window_id && window_bounds(ev->window_id, &bounds)) {
-            wid = ev->window_id;
-        } else {
-            wid = frontmost_window(&bounds);
-            if (!wid) {
-                fs = 1;
-                bounds = CGDisplayBounds(CGMainDisplayID());
-            }
-        }
-    } else {
-        fs = 1;
-        bounds = CGDisplayBounds(CGMainDisplayID());
+static void ring_push(void) {
+    cap_frame_t *slot = &g_ring[g_ring_head];
+    if (slot->rgba) free(slot->rgba);
+    if (!capture_frame_into(slot, CGMainDisplayID())) {
+        slot->rgba = NULL; slot->w = slot->h = 0; slot->t = 0;
+        slot->wid = 0; slot->region = CGRectZero;
     }
+    g_ring_head = (g_ring_head + 1) % FRAME_CAP;
+    if (g_ring_count < FRAME_CAP) g_ring_count++;
+}
 
-    NSImage *src = grab_screenshot(fs, wid);
-    if (!src) return -1;
+/* 从新到旧选帧；FOCUS 时要求窗口已置顶到 ev->window_id。*/
+static cap_frame_t *select_frame(const step_event_t *ev) {
+    if (g_ring_count == 0) return NULL;
+    double target = ev->timestamp;
+    int start = (g_ring_head - 1 + FRAME_CAP) % FRAME_CAP;
+    if (ev->kind == STEP_EVENT_FOCUS && ev->window_id) {
+        for (int i = 0; i < g_ring_count; i++) {
+            int idx = (start - i + FRAME_CAP * 2) % FRAME_CAP;
+            cap_frame_t *f = &g_ring[idx];
+            if (f->rgba && f->t <= target + 0.05 && f->wid == ev->window_id) return f;
+        }
+    }
+    for (int i = 0; i < g_ring_count; i++) {
+        int idx = (start - i + FRAME_CAP * 2) % FRAME_CAP;
+        cap_frame_t *f = &g_ring[idx];
+        if (f->rgba && f->t <= target) return f;
+    }
+    return &g_ring[start];
+}
 
+/* 立即抓包含 rect 中心的显示器（多显示器用）*/
+static void capture_display_containing(CGRect rect, cap_frame_t *out) {
+    memset(out, 0, sizeof(*out));
+    CGDirectDisplayID disps[16]; uint32_t n = 0;
+    CGGetActiveDisplayList(16, disps, &n);
+    CGPoint ctr = CGPointMake(rect.origin.x + rect.size.width / 2,
+                              rect.origin.y + rect.size.height / 2);
+    CGDirectDisplayID chosen = kCGNullDirectDisplay;
+    for (uint32_t i = 0; i < n; i++)
+        if (CGRectContainsPoint(CGDisplayBounds(disps[i]), ctr)) { chosen = disps[i]; break; }
+    if (chosen == kCGNullDirectDisplay) chosen = CGMainDisplayID();
+    capture_frame_into(out, chosen);
+}
+
+/* 拷贝整帧到新缓冲（work 拥有）*/
+static void copy_frame(const cap_frame_t *src, cap_frame_t *dst) {
+    size_t sz = (size_t)src->w * src->h * 4;
+    dst->rgba = (uint8_t *)malloc(sz);
+    memcpy(dst->rgba, src->rgba, sz);
+    dst->w = src->w; dst->h = src->h; dst->t = src->t;
+    dst->wid = src->wid; dst->region = src->region;
+}
+
+/* 裁剪 src 中 rect（src 坐标系，顶向下）到新缓冲（work 拥有）*/
+static void crop_frame(const cap_frame_t *src, CGRect rect, cap_frame_t *dst) {
+    int x = (int)floor(rect.origin.x), y = (int)floor(rect.origin.y);
+    int cw = (int)ceil(rect.size.width), ch = (int)ceil(rect.size.height);
+    if (x < 0) x = 0; if (y < 0) y = 0;
+    if (x + cw > src->w) cw = src->w - x;
+    if (y + ch > src->h) ch = src->h - y;
+    if (cw < 1) cw = 1; if (ch < 1) ch = 1;
+    dst->rgba = (uint8_t *)malloc((size_t)cw * ch * 4);
+    for (int r = 0; r < ch; r++)
+        memcpy(dst->rgba + (size_t)r * cw * 4,
+               src->rgba + (size_t)(y + r) * src->w * 4 + (size_t)x * 4,
+               (size_t)cw * 4);
+    dst->w = cw; dst->h = ch; dst->t = src->t;
+    dst->wid = src->wid; dst->region = rect;
+}
+
+/* 为事件准备最终要合成的帧（裁剪/多显示器），结果写入 work（rgba 由 work 拥有）*/
+static int prepare_work_frame(const step_event_t *ev, cap_frame_t *work) {
+    cap_frame_t *sel = select_frame(ev);
+    if (!sel || !sel->rgba) {
+        if (!capture_frame_into(work, CGMainDisplayID())) return 0;
+        return 1;
+    }
+    int is_window = (!g_fullscreen && ev->window_id);
+    if (is_window) {
+        CGRect wb;
+        if (window_bounds(ev->window_id, &wb)) {
+            CGRect mb = CGDisplayBounds(CGMainDisplayID());
+            if (!CGRectIntersectsRect(mb, wb)) {
+                capture_display_containing(wb, work);
+                if (!work->rgba) return 0;
+                work->region = wb;     /* 光标定位用窗口屏幕坐标 */
+                return 1;
+            }
+            double sx = (double)sel->w / mb.size.width;
+            double sy = (double)sel->h / mb.size.height;
+            CGRect cr = CGRectMake((wb.origin.x - mb.origin.x) * sx,
+                                   (wb.origin.y - mb.origin.y) * sy,
+                                   wb.size.width * sx, wb.size.height * sy);
+            crop_frame(sel, cr, work);
+            work->region = wb;         /* 光标定位用窗口屏幕坐标 */
+            return 1;
+        }
+    }
+    copy_frame(sel, work);
+    return 1;
+}
+
+/* 主线程：把 work 合成光标/标记并编码为 WebP（webp 由调用方 free）*/
+static void composite_nsimage(cap_frame_t *work, int cx, int cy,
+                              const char *marker, uint8_t **out_webp, size_t *out_len) {
+    *out_webp = NULL; *out_len = 0;
     @autoreleasepool {
-        NSSize sz = [src size];
-        NSImage *out = [[NSImage alloc] initWithSize:sz];
+        NSBitmapImageRep *brep = [[NSBitmapImageRep alloc]
+            initWithBitmapDataPlanes:(unsigned char **)&work->rgba
+            pixelsWide:work->w pixelsHigh:work->h bitsPerSample:8
+            samplesPerPixel:4 hasAlpha:YES isPlanar:NO
+            colorSpaceName:NSDeviceRGBColorSpace
+            bytesPerRow:work->w * 4 bitsPerPixel:32];
+        NSImage *base = [[NSImage alloc] init];
+        [base addRepresentation:brep];
+
+        NSImage *out = [[NSImage alloc] initWithSize:NSMakeSize(work->w, work->h)];
         [out lockFocus];
-        [src drawAtPoint:NSMakePoint(0, 0) fromRect:NSZeroRect
-               operation:NSCompositingOperationCopy fraction:1.0];
+        [base drawAtPoint:NSMakePoint(0, 0) fromRect:NSZeroRect
+                 operation:NSCompositingOperationCopy fraction:1.0];
 
         NSCursor *cur = [NSCursor currentCursor];
         if (!cur) cur = [NSCursor arrowCursor];
         NSImage *cimg = [cur image];
         NSPoint hot = [cur hotSpot];
-        NSPoint dp = NSMakePoint(loc.x - bounds.origin.x - hot.x,
-                                 loc.y - bounds.origin.y - hot.y);
+        NSPoint dp = NSMakePoint(cx - work->region.origin.x - hot.x,
+                                 cy - work->region.origin.y - hot.y);
         if (cimg)
             [cimg drawAtPoint:dp fromRect:NSZeroRect
                     operation:NSCompositingOperationSourceOver fraction:1.0];
 
-        if (op_marker && op_marker[0]) {
-            NSString *ms = [NSString stringWithUTF8String:op_marker];
+        if (marker && marker[0]) {
+            NSString *ms = [NSString stringWithUTF8String:marker];
             NSDictionary *attr = @{
                 NSFontAttributeName: [NSFont systemFontOfSize:13],
                 NSForegroundColorAttributeName: [NSColor whiteColor]
@@ -579,30 +694,73 @@ int os_capture_screenshot(const step_event_t *ev, const char *op_marker,
         [out unlockFocus];
 
         CGImageRef ocg = [out CGImageForProposedRect:NULL context:nil hints:nil];
-        NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:ocg];
-        NSData *data = [rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
-        if (data) {
-            *out_png = (uint8_t *)malloc([data length]);
-            if (*out_png) {
-                memcpy(*out_png, [data bytes], [data length]);
-                *out_len = [data length];
-            }
+        if (ocg) {
+            NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithCGImage:ocg];
+            int w = (int)[rep pixelsWide], h = (int)[rep pixelsHigh];
+            int bpr = (int)[rep bytesPerRow];
+            const uint8_t *src = [rep bitmapData];
+            uint8_t *tight = (uint8_t *)malloc((size_t)w * h * 4);
+            for (int y = 0; y < h; y++)
+                memcpy(tight + (size_t)y * w * 4,
+                       src + (size_t)y * bpr, (size_t)w * 4);
+            uint8_t *webp = NULL;
+            size_t n = WebPEncodeRGBA(tight, w, h, w * 4, FRAME_WEBP_Q, &webp);
+            free(tight);
+            if (n) { *out_webp = webp; *out_len = n; }
+            else if (webp) free(webp);
         }
     }
-    return (*out_png != NULL) ? 0 : -1;
 }
 
-/* 异步截图：复制事件后在主队列完成抓取合成，再回调。避免阻塞事件分发。*/
-void os_async_screenshot(const step_event_t *ev, const char *op_marker,
-                         void (*cb)(uint8_t *png, size_t len, void *ud), void *ud) {
+void os_frame_capture_start(void) {
+    if (g_capq) return;
+    g_capq = dispatch_queue_create("kaca.capture", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(g_capq, ^{ ring_push(); });   /* 立即抓一帧，避免启动时空缓冲 */
+    g_capsrc = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_capq);
+    if (g_capsrc) {
+        uint64_t iv = NSEC_PER_SEC / FRAME_FPS;
+        dispatch_source_set_timer(g_capsrc,
+            dispatch_time(DISPATCH_TIME_NOW, iv), iv, iv / 2);
+        dispatch_source_set_event_handler(g_capsrc, ^{ ring_push(); });
+        dispatch_resume(g_capsrc);
+    }
+}
+
+void os_frame_capture_stop(void) {
+    if (g_capsrc) { dispatch_source_cancel(g_capsrc); g_capsrc = NULL; }
+    if (g_capq) {
+        dispatch_sync(g_capq, ^{});   /* 排空剩余抓取块 */
+        g_capq = NULL;
+    }
+    for (int i = 0; i < FRAME_CAP; i++) {
+        if (g_ring[i].rgba) free(g_ring[i].rgba);
+        g_ring[i].rgba = NULL;
+    }
+    g_ring_count = 0; g_ring_head = 0;
+}
+
+/* 按事件时间取帧 → 裁剪 → 主线程合成光标/标记 → WebP 异步回调。
+ * 选帧在后台队列完成（不阻塞事件分发）；合成在主队列（依赖 AppKit）。*/
+void os_grab_frame_for_event(const step_event_t *ev, const char *op_marker,
+                             void (*cb)(uint8_t *data, size_t len, void *ud), void *ud) {
     step_event_t *e = (step_event_t *)malloc(sizeof(*e));
     if (!e) { cb(NULL, 0, ud); return; }
     *e = *ev;
     char *m = op_marker ? strdup(op_marker) : NULL;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        uint8_t *png = NULL; size_t len = 0;
-        os_capture_screenshot(e, m, &png, &len);
-        cb(png, len, ud);
+    dispatch_queue_t q = g_capq ? g_capq : dispatch_get_global_queue(0, 0);
+    dispatch_async(q, ^{
+        __block cap_frame_t work; memset(&work, 0, sizeof(work));
+        int ok = prepare_work_frame(e, &work);
+        if (ok) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                uint8_t *webp = NULL; size_t len = 0;
+                composite_nsimage(&work, e->cursor_x, e->cursor_y, m, &webp, &len);
+                cb(webp, len, ud);
+                if (work.rgba) free(work.rgba);
+            });
+        } else {
+            cb(NULL, 0, ud);
+        }
         free(e); free(m);
     });
 }

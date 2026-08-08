@@ -38,7 +38,7 @@ src/
   recorder.c/.h       公共逻辑：步骤列表、滚动分组、HTML 生成（不含任何平台 API）
   base64.c/.h         Base64 编码
   os/os_api.h         统一抽象接口（★核心：所有平台相关能力都从这里走）
-  os/macos/           macOS 实现（CGEventTap + screencapture + AppKit 工具条）
+  os/macos/           macOS 实现（CGEventTap + 帧环形缓冲 CGDisplayCreateImage + libwebp + AppKit 工具条）
   os/windows/         Windows 桩（同接口，待补全）
   os/linux/           Linux 桩（最低优先级）
 tests/recorder_test.c 无界面自测
@@ -62,10 +62,10 @@ tests/recorder_test.c 无界面自测
 
 ## 平台注意事项（macOS 27 SDK）
 
-- 旧的 `CGDisplayCreateImage` / `CGWindowListCreateImage` **已被移除**，截图改用系统命令 `screencapture`（`-x -t png`，窗口用 `-l <windowID>`）。
+- **截图实时对齐（重要）**：不再用 `screencapture` 子进程。`CGDisplayCreateImage` / `CGWindowListCreateImage` 在当前 SDK 仍可用（旧笔记「已被移除」是误判）。后台以固定帧率（12fps）用进程内 `CGDisplayCreateImage` 持续抓整屏，每帧打 `CFAbsoluteTime` 时间戳存入**环形缓冲**（约 3 秒）；事件发生时从缓冲里挑「时间戳不晚于事件时刻」、且（FOCUS 时）前台窗口已置顶的那一帧 → 截图时间与事件时间对齐，不再「事件后很久才拍」。窗口模式按事件时冻结的 `window_id` 裁剪；多显示器立即抓对应屏。
+- 帧选择/裁剪在**后台队列**完成（不阻塞事件分发）；光标与操作标记的**合成在主线程**（AppKit），最终用 **libwebp**（vendored 静态链接，`third_party/libwebp`）编码为 **WebP** 内嵌报告，体积远小于 PNG。
 - 事件常量已改名：用 `kCGEventLeftMouseDown` / `kCGEventRightMouseDown` / `kCGEventOtherMouseDown`（无 `kCGEventMouseDown`）。
 - 事件捕获 `CGEventTap`、窗口信息 `CGWindowListCopyWindowInfo`、控件文本 Accessibility `AXUIElement` 仍是纯 C；光标图像（`NSCursor`）与工具条（AppKit）必须 Objective-C。
-- 截图/指针合成需在**主线程**执行：用 `os_run_on_main()`（macOS 为 dispatch 到主队列）。
 
 ## 编码规范
 

@@ -29,9 +29,9 @@ typedef struct {
     char     control_text[512];
     char     exe_path[512];
     int      cursor_x, cursor_y;
-    /* 截图 */
-    uint8_t *png;
-    size_t   png_len;
+    /* 截图（WebP）*/
+    uint8_t *img;
+    size_t   img_len;
 } step_t;
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -217,8 +217,8 @@ static void attach_screenshot(uint8_t *png, size_t len, void *ud) {
     pthread_mutex_lock(&g_lock);
     if (*idxp >= 0 && *idxp < g_step_count) {
         step_t *s = &g_steps[*idxp];
-        s->png = png;
-        s->png_len = len;
+        s->img = png;
+        s->img_len = len;
     } else {
         free(png);
     }
@@ -253,14 +253,14 @@ static void add_step_ex(const step_event_t *ev, const char *desc, const char *ma
     strncpy(s->exe_path, ev->exe_path, sizeof(s->exe_path) - 1);
     s->cursor_x   = ev->cursor_x;
     s->cursor_y   = ev->cursor_y;
-    s->png        = NULL;
-    s->png_len    = 0;
+    s->img        = NULL;
+    s->img_len    = 0;
     g_shots_inflight++;
     pthread_mutex_unlock(&g_lock);
 
     /* 截图异步进行，避免阻塞事件分发（否则会卡顿并丢事件）*/
     int *idxp = (int *)malloc(sizeof(int));
-    if (idxp) { *idxp = idx; os_async_screenshot(ev, marker, attach_screenshot, idxp); }
+    if (idxp) { *idxp = idx; os_grab_frame_for_event(ev, marker, attach_screenshot, idxp); }
 }
 
 static void add_step(const step_event_t *ev, const char *desc, const char *marker) {
@@ -269,7 +269,7 @@ static void add_step(const step_event_t *ev, const char *desc, const char *marke
 
 static void free_steps(void) {
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < g_step_count; i++) free(g_steps[i].png);
+    for (int i = 0; i < g_step_count; i++) free(g_steps[i].img);
     g_step_count = 0;
     pthread_mutex_unlock(&g_lock);
 }
@@ -626,11 +626,11 @@ static char *build_html(void) {
                 sb_append(&sb, "<div class=\"pause\">停顿 %d 秒后继续</div>", s->pause_after);
         }
 
-        if (s->png && s->png_len) {
+        if (s->img && s->img_len) {
             char *b64 = NULL;
-            base64_encode(s->png, s->png_len, &b64);
+            base64_encode(s->img, s->img_len, &b64);
             if (b64) {
-                sb_append(&sb, "<img class=\"shot\" src=\"data:image/png;base64,%s\">", b64);
+                sb_append(&sb, "<img class=\"shot\" src=\"data:image/webp;base64,%s\">", b64);
                 free(b64);
             }
         }

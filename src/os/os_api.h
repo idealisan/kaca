@@ -92,23 +92,26 @@ int  os_start_capture(step_event_cb cb, void *userdata);
 void os_stop_capture(void);
 
 /*
- * 截取当前窗口（或全屏）并合成鼠标指针图标 + 操作标记。
- * op_marker 可为 NULL（如按键事件）。成功返回 0，*out_png 由调用方 free。
- * 注意：必须在主线程调用（依赖 AppKit）。一般不要直接从事件回调里同步调用，
- * 否则会阻塞事件分发导致系统卡顿、事件丢失。请用 os_async_screenshot。
+ * 帧环形缓冲（时间对齐用）。
+ * 录制开始时调用 os_frame_capture_start：在后台线程以固定帧率持续抓取整屏，
+ * 每帧打上 CFAbsoluteTime 时间戳存入环形缓冲。
+ * 停止时调用 os_frame_capture_stop：停止抓取并释放缓冲。
+ * 抓取用进程内 CGDisplayCreateImage（无 screencapture 子进程，延迟低），后台线程执行，
+ * 不阻塞事件分发。
  */
-int os_capture_screenshot(const step_event_t *ev,
-                          const char *op_marker,
-                          uint8_t **out_png, size_t *out_len);
+void os_frame_capture_start(void);
+void os_frame_capture_stop(void);
 
 /*
- * 异步截图：内部复制 ev，在合适线程（macOS 为主队列）完成抓取与合成，
- * 完成后回调 cb(png, len, ud)。cb 可能在主线程调用，内部需自行同步；
- * png 由回调方负责释放（recorder 持有并在 free_steps 里释放）。
- * 用于事件回调里避免阻塞事件分发。
+ * 按事件时间取一帧并合成鼠标指针 + 操作标记，编码为 WebP 后异步回调。
+ * 内部会：① 从环形缓冲选出「时间戳不晚于 ev->timestamp」、且（FOCUS 时）前台窗口
+ * 已进入 ev->window_id 的那一帧；② 窗口模式下按 ev->window_id 的 bounds 裁剪；
+ * ③ 在主线程合成光标/标记；④ libwebp 编码为 WebP。
+ * cb(data, len, ud) 的 data 为 malloc 的 WebP 字节，由回调方 free；失败则 (NULL,0)。
+ * 用于事件回调里，做到「截图时间 == 事件时间」，而非延迟很久后才拍。
  */
-void os_async_screenshot(const step_event_t *ev, const char *op_marker,
-                         void (*cb)(uint8_t *png, size_t len, void *ud), void *ud);
+void os_grab_frame_for_event(const step_event_t *ev, const char *op_marker,
+                             void (*cb)(uint8_t *data, size_t len, void *ud), void *ud);
 
 /* 当前光标位置（CG 坐标系，左上原点）。用于轮询焦点切换时记录指针位置。*/
 void os_get_cursor(int *x, int *y);
