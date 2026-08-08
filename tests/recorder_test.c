@@ -45,6 +45,24 @@ int os_get_system_info(system_info_t *out) {
 }
 void os_run_on_main(void (*fn)(void *), void *arg) { fn(arg); }
 
+void os_async_screenshot(const step_event_t *ev, const char *m,
+                         void (*cb)(uint8_t *, size_t, void *), void *ud) {
+    uint8_t *p = NULL; size_t l = 0;
+    os_capture_screenshot(ev, m, &p, &l);   /* 测试里同步完成 */
+    cb(p, l, ud);
+}
+void os_get_cursor(int *x, int *y) { *x = 0; *y = 0; }
+int os_get_frontmost_window(char *app, size_t app_n, char *title, size_t title_n,
+                            int *pid, char *exe, size_t exe_n) {
+    if (app && app_n) app[0] = '\0';
+    if (title && title_n) title[0] = '\0';
+    if (pid) *pid = 0;
+    if (exe && exe_n) exe[0] = '\0';
+    return 0;
+}
+void os_drain_main(void) {}
+char *os_show_save_dialog(const char *default_name) { (void)default_name; return NULL; }
+
 static void ev_init(step_event_t *e) { memset(e, 0, sizeof(*e)); e->timestamp = now_unix(); }
 
 #define STAGE(msg) do { printf("[stage] %s\n", msg); fflush(stdout); } while (0)

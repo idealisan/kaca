@@ -25,6 +25,18 @@ int  os_get_system_info(system_info_t *out) {
     return 0;
 }
 void os_run_on_main(void (*fn)(void *), void *arg) { fn(arg); }
+void os_async_screenshot(const step_event_t *ev, const char *m,
+                         void (*cb)(uint8_t *, size_t, void *), void *ud) {
+    (void)ev; uint8_t *p = NULL; size_t l = 0;
+    if (os_capture_screenshot(ev, m, &p, &l) == 0) cb(p, l, ud); else cb(NULL, 0, ud);
+}
+void os_get_cursor(int *x, int *y) { *x = 0; *y = 0; }
+int  os_get_frontmost_window(char *a, size_t an, char *t, size_t tn,
+                             int *pid, char *e, size_t en) {
+    (void)a;(void)an;(void)t;(void)tn;(void)pid;(void)e;(void)en; return 0;
+}
+void os_drain_main(void) {}
+char *os_show_save_dialog(const char *dn) { (void)dn; return NULL; }
 int  os_show_toolbar(toolbar_cb a, toolbar_cb b, toolbar_cb c, toolbar_cb d) {
     (void)a;(void)b;(void)c;(void)d; return -1;
 }

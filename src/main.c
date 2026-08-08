@@ -2,6 +2,13 @@
 #include "recorder.h"
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* 调试开关：--no-dialog 跳过保存对话框；--out <path> 直接保存到指定路径 */
+static int   g_no_dialog = 0;
+static const char *g_out_path = NULL;
 
 static void on_start(void) {
     recorder_start();
@@ -21,16 +28,36 @@ static void on_stop(void) {
 }
 
 static void on_save(void) {
-    const char *p = recorder_save_default();
-    if (p) printf("报告已保存: %s\n", p);
-    else   fprintf(stderr, "保存失败\n");
+    const char *path = NULL;
+    char *dlg = NULL;
+
+    if (!g_no_dialog)
+        dlg = os_show_save_dialog("step-report.html");
+
+    if (dlg) {
+        path = recorder_save_to(dlg);          /* 用户选择的路径 */
+    } else if (g_out_path) {
+        path = recorder_save_to(g_out_path);   /* 调试：--out 指定 */
+    } else if (g_no_dialog) {
+        path = recorder_save_default();        /* 调试：默认路径 */
+    }
+    /* dlg==NULL 且非调试模式：说明用户在对话框里取消了，不保存 */
+
+    if (path) printf("报告已保存: %s\n", path);
+    else      fprintf(stderr, "保存失败\n");
+    free(dlg);
 }
 
 static void on_settings(void) {
     os_toggle_capture_mode();
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-dialog") == 0)      g_no_dialog = 1;
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) g_out_path = argv[++i];
+    }
+
     if (os_init() != 0) {
         fprintf(stderr, "初始化失败\n");
         return 1;

@@ -8,9 +8,11 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <Cocoa/Cocoa.h>
 #import <Carbon/Carbon.h>
+#import <dispatch/dispatch.h>
 #import <sys/sysctl.h>
 #import <sys/time.h>
 #import <libproc.h>
+#include <stdlib.h>
 
 #include "os/os_api.h"
 
@@ -34,6 +36,15 @@ static step_event_cb g_cb = NULL;
 static void *g_ud = NULL;
 static CFMachPortRef g_tap = NULL;
 static CFRunLoopSourceRef g_src = NULL;
+
+/* 焦点轮询（检测应用/窗口切换）*/
+static NSTimer *g_focus_timer = nil;
+static char     g_last_app[256];
+static int      g_last_pid = -1;
+static char     g_last_title[256];
+static int      g_focus_baseline = 1;   /* 第一次轮询只打基线，不记录 */
+
+static void poll_frontmost(void);
 
 static int g_fullscreen = 0;  /* 0=当前窗口 1=全屏 */
 
@@ -226,6 +237,15 @@ int os_start_capture(step_event_cb cb, void *userdata) {
     g_src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, g_tap, 0);
     CFRunLoopAddSource(CFRunLoopGetCurrent(), g_src, kCFRunLoopCommonModes);
     CGEventTapEnable(g_tap, true);
+
+    /* 启动焦点轮询：检测 Dock 启动应用、Mission Control 切换、Alt-Tab 等 */
+    g_focus_baseline = 1;
+    g_last_app[0] = '\0'; g_last_pid = -1; g_last_title[0] = '\0';
+    g_focus_timer = [NSTimer scheduledTimerWithTimeInterval:0.3 repeats:YES
+                                                    block:^(NSTimer * _Nonnull t) {
+        (void)t;
+        poll_frontmost();
+    }];
     return 0;
 }
 
@@ -235,7 +255,43 @@ void os_stop_capture(void) {
         if (g_src) { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), g_src, kCFRunLoopCommonModes); CFRelease(g_src); g_src = NULL; }
         CFRelease(g_tap); g_tap = NULL;
     }
+    if (g_focus_timer) { [g_focus_timer invalidate]; g_focus_timer = nil; }
     g_cb = NULL; g_ud = NULL;
+}
+
+/* ------------------------- 焦点轮询 ------------------------- */
+static void poll_frontmost(void) {
+    if (!g_cb) return;
+    char app[256], title[256], exe[512]; int pid = 0;
+    if (!os_get_frontmost_window(app, sizeof(app), title, sizeof(title), &pid, exe, sizeof(exe)))
+        return;
+
+    if (g_focus_baseline) {
+        /* 仅记录基线，不生成步骤 */
+        g_focus_baseline = 0;
+        strncpy(g_last_app, app, sizeof(g_last_app) - 1);
+        g_last_pid = pid;
+        strncpy(g_last_title, title, sizeof(g_last_title) - 1);
+        return;
+    }
+    if (pid == g_last_pid && strcmp(title, g_last_title) == 0 && strcmp(app, g_last_app) == 0)
+        return;   /* 没变 */
+
+    /* 应用/窗口切换：生成 FOCUS 步骤 */
+    strncpy(g_last_app, app, sizeof(g_last_app) - 1);
+    g_last_pid = pid;
+    strncpy(g_last_title, title, sizeof(g_last_title) - 1);
+
+    step_event_t ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.kind = STEP_EVENT_FOCUS;
+    ev.timestamp = CFAbsoluteTimeGetCurrent() + UNIX_OFFSET;
+    os_get_cursor(&ev.cursor_x, &ev.cursor_y);
+    strncpy(ev.process_name, app, sizeof(ev.process_name) - 1);
+    strncpy(ev.window_title, title, sizeof(ev.window_title) - 1);
+    ev.pid = pid;
+    strncpy(ev.exe_path, exe, sizeof(ev.exe_path) - 1);
+    g_cb(&ev, g_ud);
 }
 
 /* ------------------------- 截图合成 ------------------------- */
@@ -328,6 +384,72 @@ int os_capture_screenshot(const step_event_t *ev, const char *op_marker,
         }
     }
     return (*out_png != NULL) ? 0 : -1;
+}
+
+/* 异步截图：复制事件后在主队列完成抓取合成，再回调。避免阻塞事件分发。*/
+void os_async_screenshot(const step_event_t *ev, const char *op_marker,
+                         void (*cb)(uint8_t *png, size_t len, void *ud), void *ud) {
+    step_event_t *e = (step_event_t *)malloc(sizeof(*e));
+    if (!e) { cb(NULL, 0, ud); return; }
+    *e = *ev;
+    char *m = op_marker ? strdup(op_marker) : NULL;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        uint8_t *png = NULL; size_t len = 0;
+        os_capture_screenshot(e, m, &png, &len);
+        cb(png, len, ud);
+        free(e); free(m);
+    });
+}
+
+void os_get_cursor(int *x, int *y) {
+    CGEventRef e = CGEventCreate(NULL);
+    CGPoint p = CGEventGetLocation(e);
+    CFRelease(e);
+    *x = (int)p.x;
+    *y = (int)p.y;
+}
+
+int os_get_frontmost_window(char *app, size_t app_n,
+                            char *title, size_t title_n,
+                            int *pid, char *exe, size_t exe_n) {
+    @autoreleasepool {
+        NSRunningApplication *ra = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!ra) return 0;
+        if (app && app_n) {
+            NSString *n = [ra localizedName];
+            if (n) { strncpy(app, [n UTF8String], app_n - 1); app[app_n - 1] = '\0'; }
+        }
+        if (pid) *pid = (int)[ra processIdentifier];
+        if (exe && exe_n) {
+            NSString *p = [[ra executableURL] path];
+            if (p) { strncpy(exe, [p UTF8String], exe_n - 1); exe[exe_n - 1] = '\0'; }
+        }
+        if (title && title_n) {
+            AXUIElementRef appref = AXUIElementCreateApplication([ra processIdentifier]);
+            if (appref) {
+                CFTypeRef win = NULL;
+                if (AXUIElementCopyAttributeValue(appref, kAXFocusedWindowAttribute,
+                                                  &win) == kAXErrorSuccess && win) {
+                    CFStringRef t = NULL;
+                    if (AXUIElementCopyAttributeValue(win, kAXTitleAttribute,
+                            (CFTypeRef *)&t) == kAXErrorSuccess && t) {
+                        const char *c = CFStringGetCStringPtr(t, kCFStringEncodingUTF8);
+                        if (c) { strncpy(title, c, title_n - 1); title[title_n - 1] = '\0'; }
+                        CFRelease(t);
+                    }
+                    CFRelease(win);
+                }
+                CFRelease(appref);
+            }
+        }
+        return 1;
+    }
+}
+
+/* 泵主 run loop，用于停止录制后把排队的异步截图块跑完 */
+void os_drain_main(void) {
+    if ([NSThread isMainThread])
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.02, false);
 }
 
 /* ------------------------- 系统信息 ------------------------- */

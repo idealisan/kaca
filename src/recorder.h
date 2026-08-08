@@ -19,7 +19,10 @@ void recorder_handle_event(const step_event_t *ev, void *userdata);
 /* 当前已录制时长（秒），供工具条刷新 */
 double recorder_elapsed(void);
 
-/* 生成并保存报告到默认路径（~/Desktop），返回路径指针（静态缓冲）或 NULL */
+/* 生成并保存报告到指定路径，成功返回路径指针（静态缓冲）或 NULL */
+const char *recorder_save_to(const char *path);
+
+/* 生成并保存报告到默认路径（当前工作目录），返回路径指针（静态缓冲）或 NULL */
 const char *recorder_save_default(void);
 
 #ifdef __cplusplus

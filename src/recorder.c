@@ -47,6 +47,9 @@ static double g_pending_last = 0;
 static pthread_t g_timer_thread;
 static int   g_timer_running = 0;
 
+/* 在途异步截图计数（停止录制后需排空）*/
+static int   g_shots_inflight = 0;
+
 /* ------------------------------------------------------------------ */
 /* 小工具                                                              */
 /* ------------------------------------------------------------------ */
@@ -153,21 +156,43 @@ static void scroll_marker(char *out, size_t n, const step_event_t *ev) {
     else if (ev->scroll_dx > 0) snprintf(out, n, "滚轮→");
     else                        snprintf(out, n, "滚轮←");
 }
+static void build_focus_desc(char *out, size_t n, const step_event_t *ev) {
+    if (ev->window_title[0])
+        snprintf(out, n, "切换到「%s」— 窗口「%s」",
+                 ev->process_name[0] ? ev->process_name : "?", ev->window_title);
+    else
+        snprintf(out, n, "切换到「%s」", ev->process_name[0] ? ev->process_name : "?");
+}
 
 /* ------------------------------------------------------------------ */
 /* 步骤写入                                                            */
 /* ------------------------------------------------------------------ */
-static void add_step(const step_event_t *ev, const char *desc, const char *marker) {
-    uint8_t *png = NULL; size_t len = 0;
-    os_capture_screenshot(ev, marker, &png, &len);
 
+/* 异步截图完成后回调：把 PNG 挂到指定序号的步骤上。*/
+static void attach_screenshot(uint8_t *png, size_t len, void *ud) {
+    int *idxp = (int *)ud;
+    pthread_mutex_lock(&g_lock);
+    if (*idxp >= 0 && *idxp < g_step_count) {
+        step_t *s = &g_steps[*idxp];
+        s->png = png;
+        s->png_len = len;
+    } else {
+        free(png);
+    }
+    if (g_shots_inflight > 0) g_shots_inflight--;
+    pthread_mutex_unlock(&g_lock);
+    free(idxp);
+}
+
+static void add_step(const step_event_t *ev, const char *desc, const char *marker) {
     pthread_mutex_lock(&g_lock);
     if (g_step_count == g_step_cap) {
         g_step_cap = g_step_cap ? g_step_cap * 2 : 32;
         step_t *ns = (step_t *)realloc(g_steps, g_step_cap * sizeof(step_t));
-        if (!ns) { free(png); pthread_mutex_unlock(&g_lock); return; }
+        if (!ns) { pthread_mutex_unlock(&g_lock); return; }
         g_steps = ns;
     }
+    int idx = g_step_count;
     step_t *s = &g_steps[g_step_count++];
     memset(s, 0, sizeof(*s));
     s->number     = g_step_count;
@@ -181,9 +206,14 @@ static void add_step(const step_event_t *ev, const char *desc, const char *marke
     strncpy(s->exe_path, ev->exe_path, sizeof(s->exe_path) - 1);
     s->cursor_x   = ev->cursor_x;
     s->cursor_y   = ev->cursor_y;
-    s->png        = png;
-    s->png_len    = len;
+    s->png        = NULL;
+    s->png_len    = 0;
+    g_shots_inflight++;
     pthread_mutex_unlock(&g_lock);
+
+    /* 截图异步进行，避免阻塞事件分发（否则会卡顿并丢事件）*/
+    int *idxp = (int *)malloc(sizeof(int));
+    if (idxp) { *idxp = idx; os_async_screenshot(ev, marker, attach_screenshot, idxp); }
 }
 
 static void free_steps(void) {
@@ -280,6 +310,11 @@ void recorder_handle_event(const step_event_t *ev, void *userdata) {
         case STEP_EVENT_SCROLL:
             handle_scroll(ev);
             break;
+        case STEP_EVENT_FOCUS: {
+            char d[256]; build_focus_desc(d, sizeof(d), ev);
+            add_step(ev, d, NULL);
+            break;
+        }
         default: break;
     }
 }
@@ -295,6 +330,7 @@ double recorder_elapsed(void) {
 void recorder_init(void) {
     g_steps = NULL; g_step_count = 0; g_step_cap = 0;
     g_recording = 0; g_pending_active = 0; g_timer_running = 0;
+    g_shots_inflight = 0;
 }
 
 void recorder_start(void) {
@@ -314,6 +350,13 @@ void recorder_stop(void) {
     g_recording = 0;
     g_timer_running = 0;
     pthread_join(g_timer_thread, NULL);
+    /* 等所有在途异步截图收尾（macOS 会泵主 run loop，避免保存时漏截图）*/
+    for (int i = 0; i < 200; i++) {
+        int inflight;
+        pthread_mutex_lock(&g_lock); inflight = g_shots_inflight; pthread_mutex_unlock(&g_lock);
+        if (inflight <= 0) break;
+        os_drain_main();
+    }
 }
 
 void recorder_free(void) {
@@ -442,16 +485,10 @@ static char *build_html(void) {
     return sb.buf;
 }
 
-const char *recorder_save_default(void) {
+const char *recorder_save_to(const char *path) {
+    if (!path || !path[0]) return NULL;
     char *html = build_html();
     if (!html) return NULL;
-
-    /* 输出到当前工作目录（即项目目录）*/
-    char path[1024];
-    time_t t = time(NULL);
-    struct tm tm; localtime_r(&t, &tm);
-    char ts[32]; strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
-    snprintf(path, sizeof(path), "step-report-%s.html", ts);
 
     FILE *f = fopen(path, "wb");
     if (!f) { free(html); return NULL; }
@@ -463,4 +500,14 @@ const char *recorder_save_default(void) {
     strncpy(ret, path, sizeof(ret) - 1);
     ret[sizeof(ret) - 1] = '\0';
     return ret;
+}
+
+const char *recorder_save_default(void) {
+    /* 输出到当前工作目录（即项目目录）*/
+    char path[1024];
+    time_t t = time(NULL);
+    struct tm tm; localtime_r(&t, &tm);
+    char ts[32]; strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
+    snprintf(path, sizeof(path), "step-report-%s.html", ts);
+    return recorder_save_to(path);
 }

@@ -8,7 +8,8 @@ BUILD   := build
 # macOS 需要的框架
 FRAME   := -framework ApplicationServices -framework CoreGraphics \
            -framework CoreFoundation -framework Cocoa -framework Carbon \
-           -framework IOKit -framework Security -framework CoreText
+           -framework IOKit -framework Security -framework CoreText \
+           -framework UniformTypeIdentifiers
 
 CFLAGS  := -std=c11 -Wall -Wextra -O2 -I$(SRC) -fobjc-arc
 

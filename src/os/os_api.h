@@ -19,7 +19,8 @@ typedef enum {
 typedef enum {
     STEP_EVENT_KEY = 0,
     STEP_EVENT_MOUSE,
-    STEP_EVENT_SCROLL
+    STEP_EVENT_SCROLL,
+    STEP_EVENT_FOCUS        /* 前台窗口/应用切换（由轮询检测）*/
 } step_event_kind_t;
 
 /* 鼠标按键 */
@@ -76,10 +77,35 @@ void os_stop_capture(void);
 /*
  * 截取当前窗口（或全屏）并合成鼠标指针图标 + 操作标记。
  * op_marker 可为 NULL（如按键事件）。成功返回 0，*out_png 由调用方 free。
+ * 注意：必须在主线程调用（依赖 AppKit）。一般不要直接从事件回调里同步调用，
+ * 否则会阻塞事件分发导致系统卡顿、事件丢失。请用 os_async_screenshot。
  */
 int os_capture_screenshot(const step_event_t *ev,
                           const char *op_marker,
                           uint8_t **out_png, size_t *out_len);
+
+/*
+ * 异步截图：内部复制 ev，在合适线程（macOS 为主队列）完成抓取与合成，
+ * 完成后回调 cb(png, len, ud)。cb 可能在主线程调用，内部需自行同步；
+ * png 由回调方负责释放（recorder 持有并在 free_steps 里释放）。
+ * 用于事件回调里避免阻塞事件分发。
+ */
+void os_async_screenshot(const step_event_t *ev, const char *op_marker,
+                         void (*cb)(uint8_t *png, size_t len, void *ud), void *ud);
+
+/* 当前光标位置（CG 坐标系，左上原点）。用于轮询焦点切换时记录指针位置。*/
+void os_get_cursor(int *x, int *y);
+
+/*
+ * 当前最前台窗口/应用信息（轮询焦点切换用）。
+ * 返回 1 表示取到，0 表示失败。各 out 可为 NULL。
+ */
+int os_get_frontmost_window(char *app, size_t app_n,
+                            char *title, size_t title_n,
+                            int *pid, char *exe, size_t exe_n);
+
+/* 在主线程泵一下 run loop（macOS 用于停止录制后等待异步截图收尾；其他平台为空操作）。*/
+void os_drain_main(void);
 
 /* 系统/硬件信息 */
 typedef struct {
@@ -99,6 +125,14 @@ void os_run_on_main(void (*fn)(void *), void *arg);
 void os_open_accessibility_settings(void);
 
 /* 工具条 UI（平台相关）*/
+
+/*
+ * 弹出保存对话框，让用户选择报告保存路径与文件名。
+ * 返回 malloc 的路径字符串（调用方 free），用户取消或不支持时返回 NULL。
+ * default_name 为默认文件名（不含目录）。
+ */
+char *os_show_save_dialog(const char *default_name);
+
 typedef void (*toolbar_cb)(void);
 int  os_show_toolbar(toolbar_cb on_start, toolbar_cb on_stop,
                      toolbar_cb on_save, toolbar_cb on_settings);

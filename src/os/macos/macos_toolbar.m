@@ -2,7 +2,9 @@
  * macOS 工具条 UI（AppKit）。横向条状，可置顶。
  */
 #import <Cocoa/Cocoa.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include "os/os_api.h"
+#include <stdlib.h>
 
 static toolbar_cb g_on_start = NULL, g_on_stop = NULL, g_on_save = NULL, g_on_settings = NULL;
 static double (*g_tick)(void) = NULL;
@@ -119,3 +121,19 @@ void os_set_recording_state(int recording) {
 
 void os_set_tick_callback(double (*cb)(void)) { g_tick = cb; }
 void os_hide_toolbar(void) { if (g_win) { [g_win close]; g_win = nil; } }
+
+char *os_show_save_dialog(const char *default_name) {
+    @autoreleasepool {
+        NSSavePanel *sp = [NSSavePanel savePanel];
+        NSString *def = default_name ? [NSString stringWithUTF8String:default_name]
+                                      : @"step-report.html";
+        [sp setNameFieldStringValue:def];
+        if (@available(macOS 11.0, *))
+            [sp setAllowedContentTypes:@[UTTypeHTML]];
+        [sp setCanCreateDirectories:YES];
+        if ([sp runModal] != NSModalResponseOK) return NULL;
+        NSString *path = [[sp URL] path];
+        if (!path) return NULL;
+        return strdup([path UTF8String]);
+    }
+}
