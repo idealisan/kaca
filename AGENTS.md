@@ -15,10 +15,18 @@
 ```bash
 make          # 编译 macOS 应用 → build/kaca（要求无警告）
 make test     # 无界面自测 → build/kaca_test 并运行（用桩替换依赖显示的 OS 调用）
-make clean    # 清理 build/
+make clean    # 清理 build/ 与 kaca.app/
+make app      # 打包成 Mac 的 .app  bundle（生成 kaca.app，含占位图标 + 临时签名）
 ```
 
 - 提交前必须：`make` 干净通过 且 `make test` 通过。
+- **打包成品是 `kaca.app`，不是命令行工具**：`make app` 会在仓库根目录生成 `kaca.app`
+  （`Contents/MacOS/kaca` + `Contents/Resources/AppIcon.icns` + `Info.plist`），并对
+  其做 **ad-hoc 临时签名**（`codesign --force --deep --sign -`）。无开发者证书，
+  仅本机可运行；分发给他机需正式签名公证。`.app` / `AppIcon.icns` / `AppIcon.iconset/`
+  已写入 `.gitignore`，不入库。
+- 占位图标由 `scripts/make_appicon.py` 生成（纯 Python 标准库 PNG 编码 → `iconutil`
+  转 icns），无第三方库依赖。
 - 实际运行需要「辅助功能」权限（系统设置 → 隐私与安全性 → 辅助功能）。
 - **不要在本机做真实交互式录制测试**（用户明确要求）；逻辑验证一律走 `make test` 的桩。
 

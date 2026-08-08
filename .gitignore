@@ -4,5 +4,10 @@ build/
 # 运行生成的步骤报告（输出到项目目录）
 step-report-*.html
 
+# 打包产物
+kaca.app/
+resources/AppIcon.icns
+resources/AppIcon.iconset/
+
 # macOS
 .DS_Store
