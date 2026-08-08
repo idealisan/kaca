@@ -138,7 +138,28 @@ static void sb_append_str(sb_t *s, const char *str) {
 /* ------------------------------------------------------------------ */
 /* 描述文本构造                                                        */
 /* ------------------------------------------------------------------ */
+/* 是否为修饰键本身（Command/Shift/Control/Option 等），与「按住它们组合的键」区分 */
+static int is_modifier_key(const char *name) {
+    if (!name || !*name) return 0;
+    return strcmp(name, "Command") == 0 || strcmp(name, "Shift") == 0 ||
+           strcmp(name, "Control") == 0 || strcmp(name, "Option") == 0 ||
+           strcmp(name, "RightShift") == 0 || strcmp(name, "RightControl") == 0 ||
+           strcmp(name, "RightOption") == 0 || strcmp(name, "CapsLock") == 0 ||
+           strcmp(name, "Fn") == 0;
+}
+
 static void build_key_desc(char *out, size_t n, const step_event_t *ev) {
+    /* 快捷键组合（按住 Command/Control/Option 的非修饰键）：渲染成 ⌘V 之类 */
+    if ((ev->mod_flags & (MOD_COMMAND | MOD_CONTROL | MOD_OPTION)) &&
+        !is_modifier_key(ev->key_name)) {
+        char mods[8] = "";
+        if (ev->mod_flags & MOD_COMMAND) strncat(mods, "⌘", sizeof(mods) - 1);
+        if (ev->mod_flags & MOD_CONTROL) strncat(mods, "⌃", sizeof(mods) - 1);
+        if (ev->mod_flags & MOD_OPTION)  strncat(mods, "⌥", sizeof(mods) - 1);
+        if (ev->mod_flags & MOD_SHIFT)   strncat(mods, "⇧", sizeof(mods) - 1);
+        snprintf(out, n, "按下 %s%s", mods, ev->key_name[0] ? ev->key_name : "?");
+        return;
+    }
     snprintf(out, n, "按下按键 [%s]", ev->key_name[0] ? ev->key_name : "?");
 }
 static void build_mouse_desc(char *out, size_t n, const step_event_t *ev) {
@@ -380,6 +401,21 @@ static void typing_note_pause(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* 判断合并后的输入文字是否含真实内容（忽略空白/换行与「（停顿 N 秒）」标注）。
+   仅按了回车/空格激活输入框、未真正输入文字的情况应判为无内容。*/
+static int typing_has_real_text(const char *t) {
+    for (; *t; ) {
+        if (strncmp(t, "（停顿", 9) == 0) {       /* 「（停顿」为 9 字节 UTF-8 */
+            const char *q = strstr(t, "）");        /* 跳到「）」之后（3 字节）*/
+            if (!q) break;
+            t = q + 3; continue;
+        }
+        if (*t != ' ' && *t != '\n' && *t != '\r' && *t != '\t') return 1;
+        t++;
+    }
+    return 0;
+}
+
 /* 把整段文字输入定稿为「一步」（一次动作 / 一张截图）。*/
 static void finalize_typing(void) {
     char text[TYPING_MAX + 1];
@@ -392,6 +428,10 @@ static void finalize_typing(void) {
     last = g_typing.last;
     g_typing.active = 0;
     pthread_mutex_unlock(&g_lock);
+
+    /* 整段只有空白/换行/停顿标注、没有真实文字（如仅按回车激活输入框）：
+       不记为「用户输入了文字」，避免产生空白的输入步骤。*/
+    if (!typing_has_real_text(text)) return;
 
     last.kind = STEP_EVENT_TYPE;
     char desc[256];

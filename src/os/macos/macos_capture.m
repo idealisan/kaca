@@ -114,6 +114,16 @@ static int clamp_pct(int v) {
     return v;
 }
 
+/* 是否为修饰键（Command/Shift/Control/Option 等本身，区别于「按住它们组合的键」）*/
+static int is_modifier_key(const char *name) {
+    if (!name || !*name) return 0;
+    return strcmp(name, "Command") == 0 || strcmp(name, "Shift") == 0 ||
+           strcmp(name, "Control") == 0 || strcmp(name, "Option") == 0 ||
+           strcmp(name, "RightShift") == 0 || strcmp(name, "RightControl") == 0 ||
+           strcmp(name, "RightOption") == 0 || strcmp(name, "CapsLock") == 0 ||
+           strcmp(name, "Fn") == 0;
+}
+
 /*
  * 为一次按键计算 key_text：
  * - 可打印字符 -> 该字符本身（用于合并输入）
@@ -126,6 +136,12 @@ static void cf_to_utf8(CFStringRef s, char *out, size_t n);
 
 static void fill_key_text(step_event_t *ev, CGEventRef event) {
     ev->key_text[0] = '\0';
+    /* 快捷键组合：按住 Command/Control/Option 且当前键不是修饰键本身时，
+       视为快捷键（如 ⌘V），不并入「文字输入」*/
+    if ((ev->mod_flags & (MOD_COMMAND | MOD_CONTROL | MOD_OPTION)) &&
+        !is_modifier_key(ev->key_name))
+        return;
+
     UniChar buf[16]; UniCharCount n = 0;
     CGEventKeyboardGetUnicodeString(event, 16, &n, buf);
     char utf8[64]; utf8[0] = '\0';
@@ -214,13 +230,19 @@ static int window_bounds(uint32_t wid, CGRect *outBounds) {
     return found;
 }
 
-/* 找到光标所在窗口，返回其 rect 与 windowID（找不到返回 0）*/
+/* 找到光标所在的最前台窗口（最小 layer；同级优先非 Dock），返回其 rect 与 windowID。
+   注意：Dock 有一个覆盖全屏的透明窗口，若简单取「第一个包含该点的窗口」会误选 Dock，
+   因此要取 layer 最小者（最靠前），且同级时优先非 Dock 的窗口。*/
 static int window_at_point(CGPoint loc, CGRect *outBounds, uint32_t *outWin) {
     CFArrayRef list = CGWindowListCopyWindowInfo(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID);
     if (!list) return 0;
     int found = 0;
+    int best_layer = (1 << 20);
+    int best_is_dock = 1;
+    CGRect best_b = CGRectZero;
+    uint32_t best_wid = 0;
     CFIndex n = CFArrayGetCount(list);
     for (CFIndex i = 0; i < n; i++) {
         CFDictionaryRef d = (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
@@ -230,16 +252,27 @@ static int window_at_point(CGPoint loc, CGRect *outBounds, uint32_t *outWin) {
         if (!CGRectMakeWithDictionaryRepresentation(bdict, &b)) continue;
         if (!CGRectContainsPoint(b, loc)) continue;
 
-        CFNumberRef num = CFDictionaryGetValue(d, kCGWindowNumber);
-        uint32_t wid = 0;
-        if (num) CFNumberGetValue(num, kCFNumberSInt32Type, &wid);
-        *outBounds = b;
-        *outWin = wid;
-        found = 1;
-        /* 取第一个命中的即可（一般是最靠前的）*/
-        break;
+        CFNumberRef ln = CFDictionaryGetValue(d, kCGWindowLayer);
+        int layer = 0; if (ln) CFNumberGetValue(ln, kCFNumberSInt32Type, &layer);
+        CFStringRef owner = CFDictionaryGetValue(d, kCGWindowOwnerName);
+        int is_dock = 0;
+        if (owner) {
+            char o[64]; cf_to_utf8(owner, o, sizeof(o));
+            is_dock = (strcmp(o, "Dock") == 0);
+        }
+
+        /* 选 layer 最小者；layer 相同时优先非 Dock */
+        if (!found || layer < best_layer ||
+            (layer == best_layer && best_is_dock && !is_dock)) {
+            best_layer = layer; best_is_dock = is_dock;
+            best_b = b; best_wid = 0;
+            CFNumberRef num = CFDictionaryGetValue(d, kCGWindowNumber);
+            if (num) CFNumberGetValue(num, kCFNumberSInt32Type, &best_wid);
+            found = 1;
+        }
     }
     CFRelease(list);
+    if (found) { *outBounds = best_b; *outWin = best_wid; }
     return found;
 }
 
@@ -306,14 +339,17 @@ static CGEventRef event_tap_cb(CGEventTapProxy proxy, CGEventType type,
     fill_context(&ev, loc);
 
     switch (type) {
-        case kCGEventKeyDown: {
-            int64_t kc = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-            ev.kind = STEP_EVENT_KEY;
-            ev.keycode = (int)kc;
-            keycode_to_name((int)kc, ev.key_name, sizeof(ev.key_name));
-            fill_key_text(&ev, event);
-            break;
-        }
+    case kCGEventKeyDown: {
+        int64_t kc = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+        ev.kind = STEP_EVENT_KEY;
+        ev.keycode = (int)kc;
+        keycode_to_name((int)kc, ev.key_name, sizeof(ev.key_name));
+        ev.mod_flags = (uint32_t)(CGEventGetFlags(event) &
+            (kCGEventFlagMaskCommand | kCGEventFlagMaskControl |
+             kCGEventFlagMaskAlternate | kCGEventFlagMaskShift));
+        fill_key_text(&ev, event);
+        break;
+    }
         case kCGEventLeftMouseDown:
         case kCGEventRightMouseDown:
         case kCGEventOtherMouseDown: {
@@ -431,6 +467,9 @@ static void poll_frontmost(void) {
         strncpy(ev.window_title, title, sizeof(ev.window_title) - 1);
         ev.pid = pid;
         strncpy(ev.exe_path, exe, sizeof(ev.exe_path) - 1);
+        /* 冻结切换到的窗口 ID，使异步截图按 -l <wid> 截正确的窗口，
+           避免快速切换时截到随后切到的窗口（如 Firefox 切到却截成 Chrome）*/
+        ev.window_id = frontmost_window(NULL);
         g_cb(&ev, g_ud);
         return;
     }

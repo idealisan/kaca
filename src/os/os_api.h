@@ -69,7 +69,14 @@ typedef struct {
     char              exe_path[512];
     uint32_t          window_id;   /* 事件发生时所在窗口 ID（0=无）；截图按它冻结目标，
                                       避免异步截图时用户已切走导致截到别的窗口 */
+    uint32_t          mod_flags;   /* 修饰键标志（见下方 MOD_* 位定义）；用于识别快捷键组合 */
 } step_event_t;
+
+/* 修饰键标志位（值取自 Quartz kCGEventFlagMask*；公共逻辑与平台共用此定义）*/
+#define MOD_COMMAND  0x100000u   /* kCGEventFlagMaskCommand */
+#define MOD_CONTROL  0x040000u   /* kCGEventFlagMaskControl  */
+#define MOD_OPTION   0x080000u   /* kCGEventFlagMaskAlternate*/
+#define MOD_SHIFT    0x020000u   /* kCGEventFlagMaskShift   */
 
 typedef void (*step_event_cb)(const step_event_t *ev, void *userdata);
 

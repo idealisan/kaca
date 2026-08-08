@@ -124,11 +124,48 @@ int main(void) {
     usleep(1200000);
     STAGE("second scroll finalized");
 
+    /* 5) 仅按回车（空白输入）：不应生成「用户输入了文字」步骤 */
+    ev_init(&e); e.kind = STEP_EVENT_KEY; e.keycode = 0x24; strcpy(e.key_name, "Return");
+    e.key_text[0] = '\n'; e.key_text[1] = '\0';
+    recorder_handle_event(&e, NULL);
+    STAGE("blank return fed");
+
+    /* 6) 快捷键 ⌘V：mod_flags 含 Command，不并入打字，应记「按下 ⌘V」*/
+    ev_init(&e); e.kind = STEP_EVENT_KEY; e.keycode = 0x09; strcpy(e.key_name, "V");
+    e.key_text[0] = '\0'; e.mod_flags = MOD_COMMAND;
+    recorder_handle_event(&e, NULL);
+    STAGE("shortcut fed");
+
     recorder_stop();
     STAGE("stopped");
 
     const char *path = recorder_save_default();
     printf("saved: %s\n", path ? path : "NULL");
+
+    /* 自检：验证新行为不被回归 */
+    int fail = 0;
+    if (path) {
+        FILE *f = fopen(path, "rb");
+        if (f) {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char *buf = (char *)malloc((size_t)sz + 1);
+            if (buf) {
+                fread(buf, 1, (size_t)sz, f); buf[sz] = '\0'; fclose(f);
+                int n_type = 0; const char *p = buf;
+                while ((p = strstr(p, "用户输入了文字"))) { n_type++; p++; }
+                if (n_type != 1) {
+                    fprintf(stderr, "SELFCHECK FAIL: 「用户输入了文字」出现 %d 次（期望 1）\n", n_type);
+                    fail = 1;
+                }
+                if (!strstr(buf, "按下 ⌘V")) {
+                    fprintf(stderr, "SELFCHECK FAIL: 未找到「按下 ⌘V」\n");
+                    fail = 1;
+                }
+                free(buf);
+            } else fclose(f);
+        }
+    }
+    if (fail) { recorder_free(); return 1; }
 
     recorder_free();
     STAGE("done");
