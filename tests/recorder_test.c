@@ -136,6 +136,13 @@ int main(void) {
     recorder_handle_event(&e, NULL);
     STAGE("shortcut fed");
 
+    /* 7) 触控板横向滑动（切换桌面）：记为手势切换而非普通滚动 */
+    ev_init(&e); e.kind = STEP_EVENT_SCROLL; e.scroll_dx = 3; e.scroll_dy = 0;
+    e.cursor_x = 300; e.cursor_y = 400;
+    recorder_handle_event(&e, NULL);
+    usleep(1200000);
+    STAGE("horizontal swipe fed");
+
     recorder_stop();
     STAGE("stopped");
 
@@ -159,6 +166,10 @@ int main(void) {
                 }
                 if (!strstr(buf, "按下 ⌘V")) {
                     fprintf(stderr, "SELFCHECK FAIL: 未找到「按下 ⌘V」\n");
+                    fail = 1;
+                }
+                if (!strstr(buf, "切换了桌面")) {
+                    fprintf(stderr, "SELFCHECK FAIL: 未找到「切换了桌面」（横向滑动应记为桌面切换）\n");
                     fail = 1;
                 }
                 free(buf);

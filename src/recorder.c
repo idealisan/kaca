@@ -177,14 +177,14 @@ static void build_mouse_desc(char *out, size_t n, const step_event_t *ev) {
 }
 static void build_scroll_desc(char *out, size_t n, const step_event_t *ev) {
     int dy = ev->scroll_dy, dx = ev->scroll_dx;
-    if (dy != 0 && dx != 0) {
-        const char *vd = dy > 0 ? "下" : "上";
-        const char *hd = dx > 0 ? "右" : "左";
-        snprintf(out, n, "滚轮向%s/%s滚动 %d/%d 单位", vd, hd, abs(dy), abs(dx));
-    } else if (dy != 0) {
-        snprintf(out, n, "滚轮向%s滚动 %d 单位", dy > 0 ? "下" : "上", abs(dy));
+    int ady = abs(dy), adx = abs(dx);
+    if (adx >= ady) {
+        /* 横向（或零）滚动：触控板左右滑动通常对应切换桌面/空间，
+           记为手势切换并括号说明，方向按滑动方向 */
+        snprintf(out, n, "用手势%s切换了桌面（横向滚动 %d 单位）",
+                 dx >= 0 ? "向右" : "向左", adx);
     } else {
-        snprintf(out, n, "滚轮向%s滚动 %d 单位", dx > 0 ? "右" : "左", abs(dx));
+        snprintf(out, n, "滚轮向%s滚动 %d 单位", dy > 0 ? "下" : "上", ady);
     }
 }
 static void mouse_marker(char *out, size_t n, const step_event_t *ev) {

@@ -377,6 +377,15 @@ static CGEventRef event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         case kCGEventScrollWheel: {
             int64_t dy = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis1);
             int64_t dx = CGEventGetIntegerValueField(event, kCGScrollWheelEventDeltaAxis2);
+            /* 触控板横向滑动（切换桌面）的整数 delta 有时为 0，补读定点 delta */
+            if (dx == 0) {
+                double f = CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis2);
+                if (f != 0) dx = (int64_t)(f > 0 ? f + 0.5 : f - 0.5);
+            }
+            if (dy == 0) {
+                double f = CGEventGetDoubleValueField(event, kCGScrollWheelEventFixedPtDeltaAxis1);
+                if (f != 0) dy = (int64_t)(f > 0 ? f + 0.5 : f - 0.5);
+            }
             ev.kind = STEP_EVENT_SCROLL;
             ev.scroll_dx = (int)dx;
             ev.scroll_dy = (int)dy;
