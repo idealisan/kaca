@@ -39,9 +39,12 @@ static CFRunLoopSourceRef g_src = NULL;
 
 /* 焦点轮询（检测应用/窗口切换）*/
 static NSTimer *g_focus_timer = nil;
-static char     g_last_app[256];
+static char     g_last_app[256];   /* 已确认的当前状态 */
 static int      g_last_pid = -1;
 static char     g_last_title[256];
+static char     g_cand_app[256];   /* 候选：需连续两次轮询一致才确认，抑制抖动 */
+static int      g_cand_pid = -2;
+static char     g_cand_title[256];
 static int      g_focus_baseline = 1;   /* 第一次轮询只打基线，不记录 */
 
 static void poll_frontmost(void);
@@ -117,18 +120,18 @@ static int clamp_pct(int v) {
  * - 主键盘区按键（含输入法组合期间 unicode 为空的情况）-> 用键名兜底
  * - 其余（Esc/方向/F 键/修饰键等）-> 空串（视为非文字键）
  */
+/* 前向声明：CFString -> UTF-8（定义见后文） */
+static void cf_to_utf8(CFStringRef s, char *out, size_t n);
+
 static void fill_key_text(step_event_t *ev, CGEventRef event) {
     ev->key_text[0] = '\0';
     UniChar buf[16]; UniCharCount n = 0;
     CGEventKeyboardGetUnicodeString(event, 16, &n, buf);
     char utf8[64]; utf8[0] = '\0';
     if (n > 0) {
-        CFStringRef s = CFStringCreateWithBytes(kCFAllocatorDefault,
-                            (const UInt8 *)buf, (CFIndex)(n * 2),
-                            kCFStringEncodingUTF16, false);
+        CFStringRef s = CFStringCreateWithCharacters(kCFAllocatorDefault, buf, n);
         if (s) {
-            const char *c = CFStringGetCStringPtr(s, kCFStringEncodingUTF8);
-            if (c) { strncpy(utf8, c, sizeof(utf8) - 1); utf8[sizeof(utf8) - 1] = '\0'; }
+            cf_to_utf8(s, utf8, sizeof(utf8));
             CFRelease(s);
         }
     }
@@ -142,6 +145,48 @@ static void fill_key_text(step_event_t *ev, CGEventRef event) {
     if (ev->keycode >= 0 && ev->keycode <= 0x32 && ev->key_name[0])
         { strncpy(ev->key_text, ev->key_name, sizeof(ev->key_text) - 1); return; }
     ev->key_text[0] = '\0';
+}
+
+/* 把 CFString 转成 UTF-8 写入 out（总是成功转换，NULL/失败则留空）。
+   不要用 CFStringGetCStringPtr：它经常返回 NULL，且可能返回非 UTF-8 指针导致乱码。*/
+static void cf_to_utf8(CFStringRef s, char *out, size_t n) {
+    if (!s || n == 0) { if (out && n) out[0] = '\0'; return; }
+    if (!CFStringGetCString(s, out, n, kCFStringEncodingUTF8)) out[0] = '\0';
+    out[n - 1] = '\0';
+}
+
+/* 取最前台应用的窗口 ID 与 bounds（用于截图，避免按光标位置误截到 Dock 等）*/
+static uint32_t frontmost_window(CGRect *outBounds) {
+    @autoreleasepool {
+        NSRunningApplication *ra = [[NSWorkspace sharedWorkspace] frontmostApplication];
+        if (!ra) return 0;
+        pid_t pid = [ra processIdentifier];
+        CFArrayRef list = CGWindowListCopyWindowInfo(
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+            kCGNullWindowID);
+        if (!list) return 0;
+        uint32_t best = 0; int best_layer = (1 << 20);
+        CGRect bb = CGRectZero;
+        CFIndex n = CFArrayGetCount(list);
+        for (CFIndex i = 0; i < n; i++) {
+            CFDictionaryRef d = (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
+            CFNumberRef pn = CFDictionaryGetValue(d, kCGWindowOwnerPID);
+            int wp = 0; if (pn) CFNumberGetValue(pn, kCFNumberSInt32Type, &wp);
+            if (wp != pid) continue;
+            CFNumberRef ln = CFDictionaryGetValue(d, kCGWindowLayer);
+            int layer = 0; if (ln) CFNumberGetValue(ln, kCFNumberSInt32Type, &layer);
+            CFNumberRef wn = CFDictionaryGetValue(d, kCGWindowNumber);
+            uint32_t wid = 0; if (wn) CFNumberGetValue(wn, kCFNumberSInt32Type, &wid);
+            if (wid && layer <= best_layer) {
+                best = wid; best_layer = layer;
+                CFDictionaryRef bd = CFDictionaryGetValue(d, kCGWindowBounds);
+                if (bd) CGRectMakeWithDictionaryRepresentation(bd, &bb);
+            }
+        }
+        CFRelease(list);
+        if (outBounds) *outBounds = bb;
+        return best;
+    }
 }
 
 /* 找到光标所在窗口，返回其 rect 与 windowID（找不到返回 0）*/
@@ -193,14 +238,8 @@ static void fill_context(step_event_t *ev, CGPoint loc) {
                 CFNumberRef pidn = CFDictionaryGetValue(d, kCGWindowOwnerPID);
                 int pid = 0;
                 if (pidn) CFNumberGetValue(pidn, kCFNumberSInt32Type, &pid);
-                if (name) {
-                    const char *c = CFStringGetCStringPtr(name, kCFStringEncodingUTF8);
-                    if (c) strncpy(ev->window_title, c, sizeof(ev->window_title) - 1);
-                }
-                if (owner) {
-                    const char *c = CFStringGetCStringPtr(owner, kCFStringEncodingUTF8);
-                    if (c) strncpy(ev->process_name, c, sizeof(ev->process_name) - 1);
-                }
+                if (name) cf_to_utf8(name, ev->window_title, sizeof(ev->window_title));
+                if (owner) cf_to_utf8(owner, ev->process_name, sizeof(ev->process_name));
                 ev->pid = pid;
                 if (pid > 0) {
                     char path[PROC_PIDPATHINFO_MAXSIZE];
@@ -214,8 +253,7 @@ static void fill_context(step_event_t *ev, CGPoint loc) {
                             CFStringRef title = NULL;
                             if (AXUIElementCopyAttributeValue(el, kAXTitleAttribute,
                                     (CFTypeRef *)&title) == kAXErrorSuccess && title) {
-                                const char *c = CFStringGetCStringPtr(title, kCFStringEncodingUTF8);
-                                if (c) strncpy(ev->control_text, c, sizeof(ev->control_text) - 1);
+                                cf_to_utf8(title, ev->control_text, sizeof(ev->control_text));
                                 CFRelease(title);
                             }
                             CFRelease(el);
@@ -327,36 +365,50 @@ void os_stop_capture(void) {
 /* ------------------------- 焦点轮询 ------------------------- */
 static void poll_frontmost(void) {
     if (!g_cb) return;
-    char app[256], title[256], exe[512]; int pid = 0;
+    char app[256], title[256], exe[512];
+    app[0] = title[0] = exe[0] = '\0';   /* 先置空，避免 API 未写入时残留垃圾 */
+    int pid = 0;
     if (!os_get_frontmost_window(app, sizeof(app), title, sizeof(title), &pid, exe, sizeof(exe)))
         return;
+
+    /* 跳过记录器自身（工具条/窗口获得焦点不应记为一次切换）*/
+    if (pid == (int)getpid()) return;
 
     if (g_focus_baseline) {
         /* 仅记录基线，不生成步骤 */
         g_focus_baseline = 0;
-        strncpy(g_last_app, app, sizeof(g_last_app) - 1);
-        g_last_pid = pid;
+        strncpy(g_last_app, app, sizeof(g_last_app) - 1); g_last_pid = pid;
         strncpy(g_last_title, title, sizeof(g_last_title) - 1);
+        strncpy(g_cand_app, app, sizeof(g_cand_app) - 1); g_cand_pid = pid;
+        strncpy(g_cand_title, title, sizeof(g_cand_title) - 1);
         return;
     }
+
+    /* 与已确认状态相同 -> 无变化 */
     if (pid == g_last_pid && strcmp(title, g_last_title) == 0 && strcmp(app, g_last_app) == 0)
-        return;   /* 没变 */
+        return;
 
-    /* 应用/窗口切换：生成 FOCUS 步骤 */
-    strncpy(g_last_app, app, sizeof(g_last_app) - 1);
-    g_last_pid = pid;
-    strncpy(g_last_title, title, sizeof(g_last_title) - 1);
+    /* 与候选相同 -> 连续两次轮询一致，确认切换并生成 FOCUS 步骤 */
+    if (pid == g_cand_pid && strcmp(title, g_cand_title) == 0 && strcmp(app, g_cand_app) == 0) {
+        strncpy(g_last_app, app, sizeof(g_last_app) - 1); g_last_pid = pid;
+        strncpy(g_last_title, title, sizeof(g_last_title) - 1);
 
-    step_event_t ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.kind = STEP_EVENT_FOCUS;
-    ev.timestamp = CFAbsoluteTimeGetCurrent() + UNIX_OFFSET;
-    os_get_cursor(&ev.cursor_x, &ev.cursor_y);
-    strncpy(ev.process_name, app, sizeof(ev.process_name) - 1);
-    strncpy(ev.window_title, title, sizeof(ev.window_title) - 1);
-    ev.pid = pid;
-    strncpy(ev.exe_path, exe, sizeof(ev.exe_path) - 1);
-    g_cb(&ev, g_ud);
+        step_event_t ev;
+        memset(&ev, 0, sizeof(ev));
+        ev.kind = STEP_EVENT_FOCUS;
+        ev.timestamp = CFAbsoluteTimeGetCurrent() + UNIX_OFFSET;
+        os_get_cursor(&ev.cursor_x, &ev.cursor_y);
+        strncpy(ev.process_name, app, sizeof(ev.process_name) - 1);
+        strncpy(ev.window_title, title, sizeof(ev.window_title) - 1);
+        ev.pid = pid;
+        strncpy(ev.exe_path, exe, sizeof(ev.exe_path) - 1);
+        g_cb(&ev, g_ud);
+        return;
+    }
+
+    /* 不同 -> 设为候选，等下一次轮询确认（抑制单次抖动造成的重复记录）*/
+    strncpy(g_cand_app, app, sizeof(g_cand_app) - 1); g_cand_pid = pid;
+    strncpy(g_cand_title, title, sizeof(g_cand_title) - 1);
 }
 
 /* ------------------------- 截图合成 ------------------------- */
@@ -394,8 +446,14 @@ int os_capture_screenshot(const step_event_t *ev, const char *op_marker,
 
     int fs = g_fullscreen;
     CGRect bounds; uint32_t wid = 0;
-    if (!fs && window_at_point(loc, &bounds, &wid)) {
-        /* 用窗口截图 */
+    if (!fs) {
+        /* 截最前台应用的窗口（而不是光标下的窗口：否则切换窗口时光标常在
+           Dock 上，会误截到 Dock 栏）*/
+        wid = frontmost_window(&bounds);
+        if (!wid) {
+            fs = 1;
+            bounds = CGDisplayBounds(CGMainDisplayID());
+        }
     } else {
         fs = 1;
         bounds = CGDisplayBounds(CGMainDisplayID());
@@ -490,6 +548,7 @@ int os_get_frontmost_window(char *app, size_t app_n,
             if (p) { strncpy(exe, [p UTF8String], exe_n - 1); exe[exe_n - 1] = '\0'; }
         }
         if (title && title_n) {
+            title[0] = '\0';   /* 先置空，避免 AX 失败时残留垃圾 */
             AXUIElementRef appref = AXUIElementCreateApplication([ra processIdentifier]);
             if (appref) {
                 CFTypeRef win = NULL;
@@ -498,8 +557,7 @@ int os_get_frontmost_window(char *app, size_t app_n,
                     CFStringRef t = NULL;
                     if (AXUIElementCopyAttributeValue(win, kAXTitleAttribute,
                             (CFTypeRef *)&t) == kAXErrorSuccess && t) {
-                        const char *c = CFStringGetCStringPtr(t, kCFStringEncodingUTF8);
-                        if (c) { strncpy(title, c, title_n - 1); title[title_n - 1] = '\0'; }
+                        cf_to_utf8(t, title, title_n);
                         CFRelease(t);
                     }
                     CFRelease(win);

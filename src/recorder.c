@@ -47,13 +47,15 @@ static step_event_t g_pending;
 static int   g_pending_active = 0;
 static double g_pending_last = 0;
 
-/* 进行中的文字输入（连续按键合并为一次动作；停顿 >3s 视为一段结束）*/
+/* 进行中的文字输入（连续按键合并为一次动作；中间停顿 >3s 不拆段，
+   只在正文里标注「（停顿 N 秒）」，整段仍是一次动作 / 一张截图）*/
 #define TYPING_MAX 1023
 static struct {
     int          active;
     double       last_time;
     char         text[TYPING_MAX + 1];
     int          count;        /* 累计按键次数 */
+    int          pause_noted;  /* 本次停顿是否已记录，避免重复标注 */
     step_event_t last;         /* 最近一次按键事件（保留上下文/光标，用于截图）*/
 } g_typing;
 
@@ -300,9 +302,10 @@ static void handle_scroll(const step_event_t *ev) {
     pthread_mutex_unlock(&g_lock);
 }
 
+/* 前向声明：文字输入停顿标注（定义见后文） */
+static void typing_note_pause(void);
+
 /* 滚动计时线程：每 100ms 检查，停顿 >1 秒则回主线程定稿 */
-static void finalize_typing(int from_pause);   /* 前向声明（timer_main 用到）*/
-static void finalize_typing_on_timer(void *ud) { (void)ud; finalize_typing(1); }
 static void *timer_main(void *arg) {
     (void)arg;
     while (g_timer_running) {
@@ -317,9 +320,9 @@ static void *timer_main(void *arg) {
         if (s_active && (now - s_last > 1.0)) {
             os_run_on_main((void (*)(void *))finalize_pending, NULL);
         }
-        /* 文字输入停顿 >3 秒：定稿为一段（回到主线程截图）*/
+        /* 文字输入停顿 >3 秒：在正文里标注一次停顿，但不拆段、不新增截图 */
         if (t_active && (now - t_last > 3.0)) {
-            os_run_on_main(finalize_typing_on_timer, NULL);
+            typing_note_pause();
         }
     }
     return NULL;
@@ -340,6 +343,7 @@ static void typing_append(const step_event_t *ev) {
         g_typing.last_time = ev->timestamp;
         g_typing.text[0] = '\0';
         g_typing.count = 0;
+        g_typing.pause_noted = 0;
     }
     size_t cur = strlen(g_typing.text);
     size_t add = strlen(ev->key_text);
@@ -352,26 +356,47 @@ static void typing_append(const step_event_t *ev) {
     pthread_mutex_unlock(&g_lock);
 }
 
-/* 把当前文字输入定稿为一步。
- * from_pause: 1=因停顿定时触发（停顿 >3s，总是记录停顿秒数）；
- *             0=被其他动作打断（仅当实际停顿 >3s 才记录）。*/
-static void finalize_typing(int from_pause) {
+/* 文字输入停顿 >3 秒：在正文中标注一次「（停顿 N 秒）」，但不拆段。
+   整段输入仍作为一次动作、一张截图，直到被其他动作打断或停止录制。*/
+static void typing_note_pause(void) {
     double now = now_unix();
     pthread_mutex_lock(&g_lock);
-    if (!g_typing.active) { pthread_mutex_unlock(&g_lock); return; }
-    int gap = (int)(now - g_typing.last_time + 0.5);
-    int pause_after = (from_pause || gap > 3) ? gap : 0;
+    if (!g_typing.active || g_typing.pause_noted) {
+        /* 已标注过则顺手把 last_time 推到现在，避免反复触发 */
+        if (g_typing.active) g_typing.last_time = now;
+        pthread_mutex_unlock(&g_lock);
+        return;
+    }
+    double idle = now - g_typing.last_time;
+    if (idle <= 3.0) { pthread_mutex_unlock(&g_lock); return; }
+    int secs = (int)(idle + 0.5);
+    size_t cur = strlen(g_typing.text);
+    int need = (int)strlen("\n（停顿 0 秒）\n") + 10;
+    if (cur + (size_t)need <= TYPING_MAX) {
+        snprintf(g_typing.text + cur, TYPING_MAX - cur + 1, "\n（停顿 %d 秒）\n", secs);
+    }
+    g_typing.pause_noted = 1;
+    g_typing.last_time = now;   /* 重置，直到再次按键才允许标注下一次停顿 */
+    pthread_mutex_unlock(&g_lock);
+}
+
+/* 把整段文字输入定稿为「一步」（一次动作 / 一张截图）。*/
+static void finalize_typing(void) {
     char text[TYPING_MAX + 1];
+    int count;
+    step_event_t last;
+    pthread_mutex_lock(&g_lock);
+    if (!g_typing.active) { pthread_mutex_unlock(&g_lock); return; }
     memcpy(text, g_typing.text, sizeof(text));
-    int count = g_typing.count;
-    step_event_t last = g_typing.last;
+    count = g_typing.count;
+    last = g_typing.last;
     g_typing.active = 0;
     pthread_mutex_unlock(&g_lock);
 
     last.kind = STEP_EVENT_TYPE;
     char desc[256];
     snprintf(desc, sizeof(desc), "用户输入了文字（%d 次按键）", count);
-    add_step_ex(&last, desc, NULL, text, pause_after);
+    add_step_ex(&last, desc, NULL, text, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -385,25 +410,25 @@ void recorder_handle_event(const step_event_t *ev, void *userdata) {
             if (key_is_typing(ev)) {
                 typing_append(ev);
             } else {
-                finalize_typing(0);              /* 非文字键：先结束输入段 */
+                finalize_typing();              /* 非文字键：先结束输入段 */
                 char d[256]; build_key_desc(d, sizeof(d), ev);
                 add_step(ev, d, NULL);
             }
             break;
         }
         case STEP_EVENT_MOUSE: {
-            finalize_typing(0);
+            finalize_typing();
             char d[256]; build_mouse_desc(d, sizeof(d), ev);
             char m[32]; mouse_marker(m, sizeof(m), ev);
             add_step(ev, d, m);
             break;
         }
         case STEP_EVENT_SCROLL:
-            finalize_typing(0);
+            finalize_typing();
             handle_scroll(ev);
             break;
         case STEP_EVENT_FOCUS: {
-            finalize_typing(0);
+            finalize_typing();
             char d[256]; build_focus_desc(d, sizeof(d), ev);
             add_step(ev, d, NULL);
             break;
@@ -442,7 +467,7 @@ void recorder_start(void) {
 
 void recorder_stop(void) {
     finalize_pending();                 /* 定稿残留滚动（主线程）*/
-    finalize_typing(0);                  /* 定稿残留文字输入（主线程）*/
+    finalize_typing();                  /* 定稿残留文字输入（主线程）*/
     g_recording = 0;
     g_timer_running = 0;
     pthread_join(g_timer_thread, NULL);
