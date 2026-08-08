@@ -357,3 +357,11 @@ void os_run_on_main(void (*fn)(void *), void *arg) {
     if ([NSThread isMainThread]) { fn(arg); return; }
     dispatch_async(dispatch_get_main_queue(), ^{ fn(arg); });
 }
+
+void os_open_accessibility_settings(void) {
+    @autoreleasepool {
+        NSURL *u = [NSURL URLWithString:
+            @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"];
+        [[NSWorkspace sharedWorkspace] openURL:u];
+    }
+}

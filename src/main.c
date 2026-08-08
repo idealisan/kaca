@@ -6,8 +6,12 @@
 static void on_start(void) {
     recorder_start();
     os_set_recording_state(1);
-    if (os_start_capture(recorder_handle_event, NULL) != 0)
-        fprintf(stderr, "警告: 事件捕获启动失败（可能未授予辅助功能权限）\n");
+    if (os_start_capture(recorder_handle_event, NULL) != 0) {
+        recorder_stop();
+        os_set_recording_state(0);
+        os_open_accessibility_settings();
+        fprintf(stderr, "事件捕获启动失败：请在本机「系统设置 → 隐私与安全性 → 辅助功能」中启用 kaca，然后重新点击「开始录制」。\n");
+    }
 }
 
 static void on_stop(void) {
@@ -32,8 +36,7 @@ int main(void) {
         return 1;
     }
     if (!os_ensure_permissions()) {
-        fprintf(stderr, "需要辅助功能权限：请在「系统设置 → 隐私与安全性 → 辅助功能」中授予本程序权限后重试。\n");
-        return 1;
+        fprintf(stderr, "提示：未检测到辅助功能授权。工具条已启动，开始录制前请在系统设置中授权 kaca。\n");
     }
 
     recorder_init();

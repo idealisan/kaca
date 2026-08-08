@@ -95,6 +95,9 @@ int os_get_system_info(system_info_t *out);
 /* 在平台主线程执行 fn(arg)（macOS 用 dispatch_async 主队列；其他平台直接调用）*/
 void os_run_on_main(void (*fn)(void *), void *arg);
 
+/* 打开系统「辅助功能」设置页（用于引导授权）*/
+void os_open_accessibility_settings(void);
+
 /* 工具条 UI（平台相关）*/
 typedef void (*toolbar_cb)(void);
 int  os_show_toolbar(toolbar_cb on_start, toolbar_cb on_stop,

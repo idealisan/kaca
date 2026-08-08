@@ -33,3 +33,4 @@ void os_set_tick_callback(double (*cb)(void)) { (void)cb; }
 void os_hide_toolbar(void) {}
 void os_toggle_capture_mode(void) {}
 const char *os_capture_mode_label(void) { return "窗口"; }
+void os_open_accessibility_settings(void) {}
