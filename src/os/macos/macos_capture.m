@@ -96,6 +96,54 @@ static void keycode_to_name(int kc, char *out, size_t n) {
     else snprintf(out, n, "0x%02X", kc);
 }
 
+/* 是否为“文字输入”字符（可打印，非控制字符）*/
+static int is_text_printable(const char *s) {
+    if (!s || !*s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+        if (*p < 0x20) return 0;   /* 控制字符（空格 0x20 及以上视为可打印）*/
+    return 1;
+}
+
+static int clamp_pct(int v) {
+    if (v < 0) return 0;
+    if (v > 100) return 100;
+    return v;
+}
+
+/*
+ * 为一次按键计算 key_text：
+ * - 可打印字符 -> 该字符本身（用于合并输入）
+ * - 回车/删除/Tab/Space -> 易读标记
+ * - 主键盘区按键（含输入法组合期间 unicode 为空的情况）-> 用键名兜底
+ * - 其余（Esc/方向/F 键/修饰键等）-> 空串（视为非文字键）
+ */
+static void fill_key_text(step_event_t *ev, CGEventRef event) {
+    ev->key_text[0] = '\0';
+    UniChar buf[16]; UniCharCount n = 0;
+    CGEventKeyboardGetUnicodeString(event, 16, &n, buf);
+    char utf8[64]; utf8[0] = '\0';
+    if (n > 0) {
+        CFStringRef s = CFStringCreateWithBytes(kCFAllocatorDefault,
+                            (const UInt8 *)buf, (CFIndex)(n * 2),
+                            kCFStringEncodingUTF16, false);
+        if (s) {
+            const char *c = CFStringGetCStringPtr(s, kCFStringEncodingUTF8);
+            if (c) { strncpy(utf8, c, sizeof(utf8) - 1); utf8[sizeof(utf8) - 1] = '\0'; }
+            CFRelease(s);
+        }
+    }
+    if (strcmp(ev->key_name, "Space") == 0)      { snprintf(ev->key_text, sizeof(ev->key_text), " "); return; }
+    if (strcmp(ev->key_name, "Return") == 0)     { snprintf(ev->key_text, sizeof(ev->key_text), "\n"); return; }
+    if (strcmp(ev->key_name, "Delete") == 0 ||
+        strcmp(ev->key_name, "ForwardDelete") == 0){ snprintf(ev->key_text, sizeof(ev->key_text), "[删除]"); return; }
+    if (strcmp(ev->key_name, "Tab") == 0)        { snprintf(ev->key_text, sizeof(ev->key_text), "[Tab]"); return; }
+    if (utf8[0] && is_text_printable(utf8))       { strncpy(ev->key_text, utf8, sizeof(ev->key_text) - 1); return; }
+    /* 兜底：主键盘区按键也视为输入（捕捉输入法拼音字母等）*/
+    if (ev->keycode >= 0 && ev->keycode <= 0x32 && ev->key_name[0])
+        { strncpy(ev->key_text, ev->key_name, sizeof(ev->key_text) - 1); return; }
+    ev->key_text[0] = '\0';
+}
+
 /* 找到光标所在窗口，返回其 rect 与 windowID（找不到返回 0）*/
 static int window_at_point(CGPoint loc, CGRect *outBounds, uint32_t *outWin) {
     CFArrayRef list = CGWindowListCopyWindowInfo(
@@ -199,6 +247,7 @@ static CGEventRef event_tap_cb(CGEventTapProxy proxy, CGEventType type,
             ev.kind = STEP_EVENT_KEY;
             ev.keycode = (int)kc;
             keycode_to_name((int)kc, ev.key_name, sizeof(ev.key_name));
+            fill_key_text(&ev, event);
             break;
         }
         case kCGEventLeftMouseDown:
@@ -207,6 +256,22 @@ static CGEventRef event_tap_cb(CGEventTapProxy proxy, CGEventType type,
             int64_t btn = CGEventGetIntegerValueField(event, kCGMouseEventButtonNumber);
             ev.kind = STEP_EVENT_MOUSE;
             ev.button = (int)btn;
+            /* 相对位置：窗口模式下相对窗口，全屏模式下相对屏幕 */
+            if (g_fullscreen) {
+                CGRect sb = CGDisplayBounds(CGMainDisplayID());
+                ev.rel_mode = 2;
+                ev.rel_x_pct = clamp_pct((int)((loc.x - sb.origin.x) / sb.size.width  * 100));
+                ev.rel_y_pct = clamp_pct((int)((loc.y - sb.origin.y) / sb.size.height * 100));
+            } else {
+                CGRect b; uint32_t wid = 0;
+                if (window_at_point(loc, &b, &wid)) {
+                    ev.rel_mode = 1;
+                    ev.rel_x_pct = clamp_pct((int)((loc.x - b.origin.x) / b.size.width  * 100));
+                    ev.rel_y_pct = clamp_pct((int)((loc.y - b.origin.y) / b.size.height * 100));
+                } else {
+                    ev.rel_mode = 0;
+                }
+            }
             break;
         }
         case kCGEventScrollWheel: {

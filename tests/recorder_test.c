@@ -77,17 +77,31 @@ int main(void) {
 
     step_event_t e;
 
-    /* 1) 按键 A */
-    ev_init(&e); e.kind = STEP_EVENT_KEY; e.keycode = 0x00; strcpy(e.key_name, "A");
-    e.cursor_x = 100; e.cursor_y = 100;
-    strcpy(e.window_title, "文档"); strcpy(e.process_name, "TestApp"); e.pid = 42;
-    strcpy(e.control_text, "保存"); strcpy(e.exe_path, "/Apps/TestApp");
-    recorder_handle_event(&e, NULL);
-    STAGE("key recorded");
+    /* 1) 连续输入 "Hello" -> 应合并为 1 个文字输入步骤 */
+    for (const char *p = "Hello"; *p; p++) {
+        ev_init(&e); e.kind = STEP_EVENT_KEY; e.keycode = 0x00; strcpy(e.key_name, "X");
+        e.key_text[0] = *p; e.key_text[1] = '\0';
+        e.cursor_x = 100; e.cursor_y = 100;
+        strcpy(e.window_title, "文档"); strcpy(e.process_name, "TestApp"); e.pid = 42;
+        strcpy(e.control_text, "保存"); strcpy(e.exe_path, "/Apps/TestApp");
+        recorder_handle_event(&e, NULL);
+    }
+    STAGE("typing burst fed");
 
-    /* 2) 鼠标左键 */
+    /* 停顿 >3s，定时器应把 "Hello" 定稿为一段 */
+    usleep(3300000);
+    STAGE("after 3.3s (typing should be finalized)");
+
+    /* 2) 非文字键（Esc，key_text 为空）-> 普通按键步骤，同时结束输入段 */
+    ev_init(&e); e.kind = STEP_EVENT_KEY; e.keycode = 0x35; strcpy(e.key_name, "Escape");
+    e.key_text[0] = '\0';
+    recorder_handle_event(&e, NULL);
+    STAGE("escape recorded");
+
+    /* 3) 鼠标左键（带相对位置）*/
     ev_init(&e); e.kind = STEP_EVENT_MOUSE; e.button = MOUSE_BTN_LEFT;
     e.cursor_x = 200; e.cursor_y = 150;
+    e.rel_mode = 1; e.rel_x_pct = 30; e.rel_y_pct = 20;
     recorder_handle_event(&e, NULL);
     STAGE("mouse recorded");
 

@@ -27,12 +27,24 @@ static void on_stop(void) {
     os_set_recording_state(0);
 }
 
+/* 生成带时间戳的默认报告文件名（与 .gitignore 的 step-report-*.html 对应）*/
+static char *default_report_name(void) {
+    time_t t = time(NULL);
+    struct tm tm; localtime_r(&t, &tm);
+    char ts[32]; strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &tm);
+    char buf[64]; snprintf(buf, sizeof(buf), "step-report-%s.html", ts);
+    return strdup(buf);
+}
+
 static void on_save(void) {
     const char *path = NULL;
     char *dlg = NULL;
 
-    if (!g_no_dialog)
-        dlg = os_show_save_dialog("step-report.html");
+    if (!g_no_dialog) {
+        char *def = default_report_name();
+        dlg = os_show_save_dialog(def);
+        free(def);
+    }
 
     if (dlg) {
         path = recorder_save_to(dlg);          /* 用户选择的路径 */

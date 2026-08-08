@@ -20,7 +20,8 @@ typedef enum {
     STEP_EVENT_KEY = 0,
     STEP_EVENT_MOUSE,
     STEP_EVENT_SCROLL,
-    STEP_EVENT_FOCUS        /* 前台窗口/应用切换（由轮询检测）*/
+    STEP_EVENT_FOCUS,       /* 前台窗口/应用切换（由轮询检测）*/
+    STEP_EVENT_TYPE         /* 连续的文字输入（由 recorder 合并多个 KEY 得到）*/
 } step_event_kind_t;
 
 /* 鼠标按键 */
@@ -45,9 +46,16 @@ typedef struct {
     /* KEY */
     int               keycode;
     char              key_name[64];
+    char              key_text[64]; /* 本次按键产生的文字，或 [回车]/[删除] 等标记；
+                                       为空表示非文字键（Esc/方向/F 键/纯修饰键等）。
+                                       用于把连续输入合并为一次「文字输入」动作。*/
 
     /* MOUSE */
     int               button;
+    /* 鼠标点击相对位置（百分比 0-100；rel_mode: 0 无 / 1 相对窗口 / 2 相对屏幕）*/
+    int               rel_x_pct;
+    int               rel_y_pct;
+    int               rel_mode;
 
     /* SCROLL（单步原始增量）*/
     int               scroll_dx;   /* 水平: +右 -左 */
